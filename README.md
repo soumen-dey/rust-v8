@@ -22,23 +22,24 @@ for Node.js**. The current implementation includes:
   imports, and CommonJS default/named interoperation. Package `import` and
   `require` export conditions are selected separately; CommonJS can
   synchronously `require()` ES module graphs without top-level await.
-- Synchronous and Tokio-worker-backed asynchronous filesystem operations for a
-  subset of common file operations, including callback and Promise APIs; a
-  small `path` implementation and a partial `Buffer` implementation.
+- Synchronous and libuv-thread-pool-backed asynchronous filesystem operations
+  for a subset of common file operations, including callback and Promise APIs;
+  a small `path` implementation and a partial `Buffer` implementation.
 - Basic `console`, `process.argv`, platform/architecture, current-directory and
   environment helpers, `process.nextTick`, timeout/interval/immediate queues,
   a basic event emitter, minimal stream classes, and a line-oriented persistent
   REPL with expression results and `.help`/`.exit` commands.
-- A turn-based event-loop pump that progresses next-tick/immediate/timer work
-  alongside async filesystem completions; the REPL continues servicing work
+- A libuv-backed event-loop wait/work queue with a JavaScript task scheduler
+  for next-tick/immediate/timer callbacks; the REPL continues servicing work
   while waiting for input, and ES modules can await filesystem Promises.
 
 The compatibility layers are incomplete and have observable differences from
 Node. Native module linking does not yet implement every Node resolution rule,
 all import-attribute forms, complete CommonJS named-export detection, or the
-entire built-in-module namespace. The event loop is a small turn-based pump,
-not libuv: asynchronous filesystem work runs on Tokio's blocking pool, and
-networking, general asynchronous handles, complete filesystem semantics,
+entire built-in-module namespace. The runtime now uses libuv for its loop,
+timer-based waits, and thread-pool work requests, but it does not yet expose
+Node's complete libuv-backed handle and request APIs. Networking, DNS,
+filesystem watchers, child processes, signals, complete filesystem semantics,
 production-grade streams and workers, npm install behavior, advanced REPL
 features, and native addons are not implemented. Timer phase ordering and
 error handling also differ from Node. Several built-in module names resolve
@@ -68,6 +69,15 @@ The V8 bindings also need the Microsoft C++ linker and Windows SDK. Install
 selecting **Desktop development with C++** (including the MSVC x64/x86 build
 tools and a Windows 10 or 11 SDK). Restart the terminal after setup. If Cargo
 cannot locate the linker, run it from **Developer PowerShell for VS 2022**.
+The libuv Rust bindings also generate platform bindings at build time and
+require LLVM's `libclang`. Install it with:
+
+```powershell
+winget install --exact --id LLVM.LLVM
+```
+
+If bindgen cannot find `libclang.dll`, set `LIBCLANG_PATH` to LLVM's `bin`
+directory (normally `C:\Program Files\LLVM\bin`) before running Cargo.
 
 ### macOS and Linux prerequisites
 
@@ -75,6 +85,9 @@ Install the stable Rust toolchain through the official `rustup` instructions at
 [rust-lang.org/tools/install](https://www.rust-lang.org/tools/install), then
 install the C++ compiler and linker provided by your platform. On macOS, install
 the Xcode Command Line Tools; on Debian/Ubuntu, install `build-essential`.
+Install LLVM/libclang as well (for example, `brew install llvm` on macOS or
+`apt install libclang-dev` on Debian/Ubuntu), and set `LIBCLANG_PATH` if
+bindgen cannot locate its shared library.
 
 ### Build
 

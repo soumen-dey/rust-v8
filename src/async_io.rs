@@ -1,9 +1,8 @@
 use crate::fs_operation;
-use serde_json::Value;
+use libuv::HandleTrait;
+use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::time::Duration;
-use tokio::runtime::{Builder, Handle, Runtime};
+use std::sync::{mpsc, Arc, Mutex};
 use v8::{Global, HandleScope, Local, PromiseResolver};
 
 const ASYNC_IO_SLOT: i32 = 1;
@@ -14,27 +13,25 @@ struct Completion {
 }
 
 pub struct AsyncIo {
-    _runtime: Runtime,
-    handle: Handle,
-    sender: Sender<Completion>,
-    receiver: Receiver<Completion>,
+    event_loop: libuv::Loop,
+    wait_timer: libuv::TimerHandle,
+    sender: mpsc::Sender<Completion>,
+    receiver: mpsc::Receiver<Completion>,
     pending: HashMap<u64, Global<PromiseResolver>>,
     next_id: u64,
 }
 
 impl AsyncIo {
     pub fn new() -> Result<Self, String> {
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("runtime-io")
-            .enable_all()
-            .build()
-            .map_err(|error| format!("could not start async I/O workers: {error}"))?;
-        let handle = runtime.handle().clone();
+        let event_loop =
+            libuv::Loop::new().map_err(|error| format!("could not create libuv loop: {error}"))?;
+        let wait_timer = event_loop
+            .timer()
+            .map_err(|error| format!("could not create libuv wait timer: {error}"))?;
         let (sender, receiver) = mpsc::channel();
         Ok(Self {
-            _runtime: runtime,
-            handle,
+            event_loop,
+            wait_timer,
             sender,
             receiver,
             pending: HashMap::new(),
@@ -66,33 +63,89 @@ impl AsyncIo {
         operation: String,
         first: String,
         second: String,
-    ) {
+    ) -> Result<(), String> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
-        self.pending.insert(id, Global::new(scope, resolver));
         let sender = self.sender.clone();
-        self.handle.spawn_blocking(move || {
-            let result = fs_operation(&operation, &first, &second);
-            let _ = sender.send(Completion { id, result });
-        });
+        let result = Arc::new(Mutex::new(Err(
+            "libuv filesystem worker did not return a result".to_owned(),
+        )));
+        let worker_result = Arc::clone(&result);
+        self.pending.insert(id, Global::new(scope, resolver));
+        let request = self.event_loop.queue_work(
+            move |_request| {
+                if let Ok(mut result) = worker_result.lock() {
+                    *result = Ok(fs_operation(&operation, &first, &second));
+                }
+            },
+            move |_request, status| {
+                let result = result
+                    .lock()
+                    .map(|result| match &*result {
+                        Ok(value) => value.clone(),
+                        Err(message) => json!({
+                            "error": {
+                                "code": "ERR_RUNTIME",
+                                "message": message,
+                            }
+                        }),
+                    })
+                    .unwrap_or_else(|_| {
+                        json!({
+                            "error": {
+                                "code": "ERR_RUNTIME",
+                                "message": "libuv filesystem worker result was poisoned",
+                            }
+                        })
+                    });
+                let result = match status {
+                    Ok(_) => result,
+                    Err(error) => json!({
+                        "error": {
+                            "code": "ERR_RUNTIME",
+                            "message": format!("libuv filesystem work failed: {error}"),
+                        }
+                    }),
+                };
+                if sender.send(Completion { id, result }).is_err() {
+                    eprintln!("node: async I/O completion receiver disconnected");
+                }
+            },
+        );
+        if let Err(error) = request {
+            self.pending.remove(&id);
+            return Err(format!("could not queue libuv filesystem work: {error}"));
+        }
+        Ok(())
     }
 
-    fn pump(&mut self, scope: &mut HandleScope, timeout: Duration) -> Result<usize, String> {
-        if self.pending.is_empty() {
+    fn pump(&mut self, scope: &mut HandleScope, timeout_ms: u64) -> Result<usize, String> {
+        if timeout_ms == 0 && !self.event_loop.is_alive() {
             return Ok(0);
         }
 
-        let first = match self.receiver.recv_timeout(timeout) {
-            Ok(completion) => Some(completion),
-            Err(RecvTimeoutError::Timeout) => None,
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err("async I/O completion channel disconnected".to_owned())
-            }
-        };
-        let mut completions = first.into_iter().collect::<Vec<_>>();
-        completions.extend(self.receiver.try_iter());
+        if timeout_ms > 0 {
+            self.wait_timer
+                .start(timeout_ms, 0, |_| {})
+                .map_err(|error| format!("could not start libuv wait timer: {error}"))?;
+        }
+
+        self.event_loop
+            .run(if timeout_ms == 0 {
+                libuv::RunMode::NoWait
+            } else {
+                libuv::RunMode::Once
+            })
+            .map_err(|error| format!("libuv event loop failed: {error}"))?;
+
+        if self.wait_timer.is_active() {
+            self.wait_timer
+                .stop()
+                .map_err(|error| format!("could not stop libuv wait timer: {error}"))?;
+        }
+
         let mut completed = 0;
-        for completion in completions {
+        for completion in self.receiver.try_iter() {
             let Some(resolver) = self.pending.remove(&completion.id) else {
                 continue;
             };
@@ -108,6 +161,17 @@ impl AsyncIo {
             completed += 1;
         }
         Ok(completed)
+    }
+}
+
+impl Drop for AsyncIo {
+    fn drop(&mut self) {
+        if !self.wait_timer.is_closing() {
+            self.wait_timer.close(());
+        }
+        if let Err(error) = self.event_loop.run(libuv::RunMode::Default) {
+            eprintln!("node: could not close libuv event loop cleanly: {error}");
+        }
     }
 }
 
@@ -132,7 +196,9 @@ pub fn submit_fs(
         return;
     }
     let state = unsafe { &mut *pointer.cast::<AsyncIo>() };
-    state.submit(scope, resolver, operation, first, second);
+    if let Err(error) = state.submit(scope, resolver, operation, first, second) {
+        reject(scope, resolver, &error);
+    }
     return_value.set(promise.into());
 }
 
@@ -150,7 +216,7 @@ pub fn pump(
         return;
     }
     let state = unsafe { &mut *pointer.cast::<AsyncIo>() };
-    match state.pump(scope, Duration::from_millis(wait_ms)) {
+    match state.pump(scope, wait_ms) {
         Ok(completed) => return_value.set(v8::Integer::new(scope, completed as i32).into()),
         Err(error) => {
             let Some(message) = v8::String::new(scope, &error) else {

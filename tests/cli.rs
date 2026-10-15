@@ -80,6 +80,42 @@ fn supports_async_filesystem_promises_and_callbacks() {
 }
 
 #[test]
+fn settles_concurrent_libuv_filesystem_requests() {
+    let project = TempProject::new();
+    let first = serde_json::to_string(&project.0.join("first.txt").to_string_lossy().as_ref())
+        .expect("first filesystem path should be encoded");
+    let second = serde_json::to_string(&project.0.join("second.txt").to_string_lossy().as_ref())
+        .expect("second filesystem path should be encoded");
+    let source = format!(
+        concat!(
+            "const fs = require('node:fs/promises');\n",
+            "Promise.all([\n",
+            "  fs.writeFile({first}, 'one'),\n",
+            "  fs.writeFile({second}, 'two'),\n",
+            "]).then(() => Promise.all([\n",
+            "  fs.readFile({first}, 'utf8'),\n",
+            "  fs.readFile({second}, 'utf8'),\n",
+            "])).then((values) => console.log(values.join(':')));\n",
+        ),
+        first = first,
+        second = second,
+    );
+
+    let output = runtime()
+        .args(["--eval", &source])
+        .output()
+        .expect("runtime process should start");
+
+    assert!(
+        output.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "one:two");
+}
+
+#[test]
 fn asynchronous_filesystem_errors_reject_with_node_error_codes() {
     let project = TempProject::new();
     let path = serde_json::to_string(&project.0.join("missing.txt").to_string_lossy().as_ref())

@@ -1089,9 +1089,7 @@
     }
     const timerWait = nextTimer ? Math.max(0, nextTimer.due - Date.now()) : Infinity;
     const wait = Math.min(Math.max(0, deadline - Date.now()), timerWait);
-    if (wait > 0 && __runtimeHasPendingAsync()) __runtimePumpAsync(wait);
-    else if (wait > 0 && nextTimer) __runtimeSleep(wait);
-    else if (wait > 0 && waitWhenIdle && !pending) __runtimeSleep(wait);
+    if (wait > 0) __runtimePumpAsync(wait);
 
     runDueTimers();
     drainNextTicks();

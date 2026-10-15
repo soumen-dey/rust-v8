@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
-use std::time::Duration;
 
 enum Command {
     Help,
@@ -113,6 +112,7 @@ fn run_repl() -> ExitCode {
             .and_then(|()| repl_loop(scope));
         async_io.detach(context);
         module_loader.detach(context);
+        drop(async_io);
         result
     };
 
@@ -311,6 +311,7 @@ fn run(source: &str, filename: &str, args: &[String], check_only: bool) -> ExitC
         };
         async_io.detach(context);
         module_loader.detach(context);
+        drop(async_io);
         result
     };
 
@@ -412,8 +413,6 @@ fn install_globals(
         async_io::has_pending,
     )?;
     install_callback(scope, global, "__runtimeProcess", runtime_process)?;
-    install_callback(scope, global, "__runtimeSleep", runtime_sleep)?;
-
     Ok(())
 }
 
@@ -847,17 +846,6 @@ fn runtime_process(
         return_value.set(value.into());
     } else {
         return_value.set_null();
-    }
-}
-
-fn runtime_sleep(
-    scope: &mut v8::HandleScope,
-    args: v8::FunctionCallbackArguments,
-    _return_value: v8::ReturnValue,
-) {
-    let milliseconds = args.get(0).to_rust_string_lossy(scope);
-    if let Ok(milliseconds) = milliseconds.parse::<u64>() {
-        std::thread::sleep(Duration::from_millis(milliseconds));
     }
 }
 
