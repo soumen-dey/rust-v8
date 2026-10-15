@@ -1,11 +1,14 @@
+mod async_io;
 mod module_loader;
 mod resolver;
 
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::mpsc::{self, TryRecvError};
+use std::thread;
 use std::time::Duration;
 
 enum Command {
@@ -80,6 +83,13 @@ fn main() -> ExitCode {
 }
 
 fn run_repl() -> ExitCode {
+    let mut async_io = match async_io::AsyncIo::new() {
+        Ok(async_io) => async_io,
+        Err(error) => {
+            eprintln!("node: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let platform = v8::new_default_platform(0, false).make_shared();
     v8::V8::initialize_platform(platform);
     v8::V8::initialize();
@@ -95,11 +105,13 @@ fn run_repl() -> ExitCode {
 
         let mut module_loader = module_loader::ModuleLoader::new();
         module_loader.attach(context);
+        async_io.attach(context);
         let result = install_globals(scope, "<repl>", &[])
             .and_then(|()| {
                 execute_script(scope, include_str!("bootstrap.js"), "<runtime bootstrap>")
             })
             .and_then(|()| repl_loop(scope));
+        async_io.detach(context);
         module_loader.detach(context);
         result
     };
@@ -120,39 +132,55 @@ fn run_repl() -> ExitCode {
 
 fn repl_loop(scope: &mut v8::ContextScope<'_, v8::HandleScope<'_>>) -> Result<(), String> {
     let interactive = io::stdin().is_terminal();
-    let mut input = String::new();
-    loop {
-        if interactive {
-            print!("> ");
-            io::stdout()
-                .flush()
-                .map_err(|error| format!("could not write REPL prompt: {error}"))?;
-        }
-        input.clear();
-        let bytes = io::stdin()
-            .read_line(&mut input)
-            .map_err(|error| format!("could not read REPL input: {error}"))?;
-        if bytes == 0 {
-            break;
-        }
-
-        match input.trim() {
-            ".exit" | ".quit" => break,
-            ".help" => {
-                println!("Enter JavaScript expressions or statements. Commands: .help, .exit");
-                continue;
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            if sender.send(line).is_err() {
+                break;
             }
-            "" => continue,
-            _ => {}
         }
+    });
 
-        match execute_repl_input(scope, &input) {
-            Ok(Some(output)) => println!("{output}"),
-            Ok(None) => {}
+    let mut input_closed = false;
+    loop {
+        match if input_closed {
+            Err(TryRecvError::Disconnected)
+        } else {
+            receiver.try_recv()
+        } {
+            Ok(Ok(input)) => {
+                match input.trim() {
+                    ".exit" | ".quit" => return Ok(()),
+                    ".help" => {
+                        println!(
+                            "Enter JavaScript expressions or statements. Commands: .help, .exit"
+                        );
+                    }
+                    "" => {}
+                    _ => match execute_repl_input(scope, &input) {
+                        Ok(Some(output)) => println!("{output}"),
+                        Ok(None) => {}
+                        Err(error) => eprintln!("{error}"),
+                    },
+                }
+                if interactive {
+                    print!("> ");
+                    io::stdout()
+                        .flush()
+                        .map_err(|error| format!("could not write REPL prompt: {error}"))?;
+                }
+            }
+            Ok(Err(error)) => return Err(format!("could not read REPL input: {error}")),
+            Err(TryRecvError::Disconnected) => input_closed = true,
+            Err(TryRecvError::Empty) => {}
+        }
+        match run_event_loop_turn(scope, 25, !input_closed) {
+            Ok(true) => {}
+            Ok(false) if input_closed => return Ok(()),
+            Ok(false) => {}
             Err(error) => eprintln!("{error}"),
         }
     }
-    Ok(())
 }
 
 fn execute_repl_input(
@@ -216,6 +244,13 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
 }
 
 fn run(source: &str, filename: &str, args: &[String], check_only: bool) -> ExitCode {
+    let mut async_io = match async_io::AsyncIo::new() {
+        Ok(async_io) => async_io,
+        Err(error) => {
+            eprintln!("node: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let platform = v8::new_default_platform(0, false).make_shared();
     v8::V8::initialize_platform(platform);
     v8::V8::initialize();
@@ -231,6 +266,7 @@ fn run(source: &str, filename: &str, args: &[String], check_only: bool) -> ExitC
 
         let mut module_loader = module_loader::ModuleLoader::new();
         module_loader.attach(context);
+        async_io.attach(context);
         let result = if let Err(error) = install_globals(scope, filename, args) {
             Err(error)
         } else {
@@ -249,8 +285,7 @@ fn run(source: &str, filename: &str, args: &[String], check_only: bool) -> ExitC
                     execute_script(scope, source, filename)
                 }
             } else if filename == "<eval>" || filename == "-" {
-                execute_script(scope, source, filename)
-                    .and_then(|()| execute_script(scope, "__runtimeDrainTasks()", "<event loop>"))
+                execute_script(scope, source, filename).and_then(|()| drain_event_loop(scope))
             } else if resolver::is_es_module(PathBuf::from(filename).as_path()) {
                 unsafe {
                     module_loader::execute(
@@ -270,10 +305,11 @@ fn run(source: &str, filename: &str, args: &[String], check_only: bool) -> ExitC
                         &format!("__runtimeRunMain({filename})"),
                         "<main module>",
                     )
-                    .and_then(|()| execute_script(scope, "__runtimeDrainTasks()", "<event loop>"))
+                    .and_then(|()| drain_event_loop(scope))
                 })
             }
         };
+        async_io.detach(context);
         module_loader.detach(context);
         result
     };
@@ -367,6 +403,14 @@ fn install_globals(
     )?;
     install_callback(scope, global, "__runtimeIsEsm", runtime_is_esm)?;
     install_callback(scope, global, "__runtimeFs", runtime_fs)?;
+    install_callback(scope, global, "__runtimeFsAsync", async_io::submit_fs)?;
+    install_callback(scope, global, "__runtimePumpAsync", async_io::pump)?;
+    install_callback(
+        scope,
+        global,
+        "__runtimeHasPendingAsync",
+        async_io::has_pending,
+    )?;
     install_callback(scope, global, "__runtimeProcess", runtime_process)?;
     install_callback(scope, global, "__runtimeSleep", runtime_sleep)?;
 
@@ -412,6 +456,41 @@ fn execute_script(
         Ok(())
     } else {
         Err(caught_exception(try_catch, "execution", filename))
+    }
+}
+
+fn run_event_loop_turn(
+    scope: &mut v8::ContextScope<'_, v8::HandleScope<'_>>,
+    wait_ms: u64,
+    wait_when_idle: bool,
+) -> Result<bool, String> {
+    let source = format!("__runtimeRunEventLoopTurn({wait_ms}, {wait_when_idle})");
+    let handle_scope = &mut v8::HandleScope::new(scope);
+    let try_catch = &mut v8::TryCatch::new(handle_scope);
+    let code = v8::String::new(try_catch, &source)
+        .ok_or_else(|| "could not allocate event-loop turn".to_owned())?;
+    let script = v8::Script::compile(try_catch, code, None)
+        .ok_or_else(|| caught_exception(try_catch, "compilation", "<event loop>"))?;
+    script
+        .run(try_catch)
+        .ok_or_else(|| caught_exception(try_catch, "execution", "<event loop>"))?;
+    AsMut::<v8::Isolate>::as_mut(try_catch).perform_microtask_checkpoint();
+    let status_code = v8::String::new(try_catch, "__runtimeHasPendingWork()")
+        .ok_or_else(|| "could not allocate event-loop status query".to_owned())?;
+    let status_script = v8::Script::compile(try_catch, status_code, None)
+        .ok_or_else(|| caught_exception(try_catch, "compilation", "<event loop>"))?;
+    let pending = status_script
+        .run(try_catch)
+        .ok_or_else(|| caught_exception(try_catch, "execution", "<event loop>"))?
+        .boolean_value(try_catch);
+    Ok(pending)
+}
+
+fn drain_event_loop(scope: &mut v8::ContextScope<'_, v8::HandleScope<'_>>) -> Result<(), String> {
+    loop {
+        if !run_event_loop_turn(scope, 250, false)? {
+            return Ok(());
+        }
     }
 }
 
@@ -575,7 +654,7 @@ fn runtime_fs(
     }
 }
 
-fn fs_operation(operation: &str, first: &str, second: &str) -> serde_json::Value {
+pub(crate) fn fs_operation(operation: &str, first: &str, second: &str) -> serde_json::Value {
     use serde_json::json;
 
     let first_path = node_path(first);

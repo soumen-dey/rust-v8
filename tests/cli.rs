@@ -39,6 +39,161 @@ fn evaluates_javascript_and_writes_console_output() {
 }
 
 #[test]
+fn supports_async_filesystem_promises_and_callbacks() {
+    let project = TempProject::new();
+    let path = project.0.join("async.txt");
+    let path = serde_json::to_string(&path.to_string_lossy().as_ref())
+        .expect("filesystem path should be encoded");
+    let source = format!(
+        concat!(
+            "const fs = require('node:fs');\n",
+            "fs.promises.writeFile({path}, 'async data')\n",
+            "  .then(() => fs.promises.readFile({path}, 'utf8'))\n",
+            "  .then((value) => {{\n",
+            "    console.log('promise:' + value);\n",
+            "    fs.readFile({path}, 'utf8', (error, callbackValue) => {{\n",
+            "      if (error) throw error;\n",
+            "      console.log('callback:' + callbackValue);\n",
+            "    }});\n",
+            "  }});\n",
+        ),
+        path = path,
+    );
+
+    let output = runtime()
+        .args(["--eval", &source])
+        .output()
+        .expect("runtime process should start");
+
+    assert!(
+        output.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        ["promise:async data", "callback:async data"]
+    );
+}
+
+#[test]
+fn asynchronous_filesystem_errors_reject_with_node_error_codes() {
+    let project = TempProject::new();
+    let path = serde_json::to_string(&project.0.join("missing.txt").to_string_lossy().as_ref())
+        .expect("filesystem path should be encoded");
+    let source = format!(
+        "require('node:fs').promises.readFile({path}).catch((error) => console.log(error.code));"
+    );
+
+    let output = runtime()
+        .args(["--eval", &source])
+        .output()
+        .expect("runtime process should start");
+
+    assert!(
+        output.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ENOENT");
+}
+
+#[test]
+fn services_timers_while_async_filesystem_work_is_pending() {
+    let project = TempProject::new();
+    let input = project.0.join("input.txt");
+    std::fs::write(&input, "ready").expect("test input should be written");
+    let path = serde_json::to_string(&input.to_string_lossy().as_ref())
+        .expect("filesystem path should be encoded");
+    let source = format!(
+        concat!(
+            "require('node:fs').promises.readFile({path}).then(() => console.log('io'));\n",
+            "setTimeout(() => console.log('timer'), 0);\n",
+            "console.log('sync');\n",
+        ),
+        path = path,
+    );
+
+    let output = runtime()
+        .args(["--eval", &source])
+        .output()
+        .expect("runtime process should start");
+
+    assert!(
+        output.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        ["sync", "timer", "io"]
+    );
+}
+
+#[test]
+fn keeps_interval_alive_until_callback_clears_it() {
+    let output = runtime()
+        .args([
+            "--eval",
+            "let count = 0; const interval = setInterval(() => { if (++count === 3) { clearInterval(interval); console.log(count); } }, 1);",
+        ])
+        .output()
+        .expect("runtime process should start");
+
+    assert!(
+        output.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "3");
+}
+
+#[test]
+fn top_level_await_can_wait_for_async_filesystem_io() {
+    let project = TempProject::new();
+    let contents_path = project.0.join("contents.txt");
+    std::fs::write(&contents_path, "from async io").expect("test input should be written");
+    let contents_path = serde_json::to_string(&contents_path.to_string_lossy().as_ref())
+        .expect("filesystem path should be encoded");
+    let entry = project.0.join("app.mjs");
+    std::fs::write(
+        &entry,
+        format!(
+            concat!(
+                "import fs from 'node:fs/promises';\n",
+                "console.log(await fs.readFile({contents_path}, 'utf8'));\n",
+            ),
+            contents_path = contents_path,
+        ),
+    )
+    .expect("ES module entry should be written");
+
+    let output = runtime()
+        .arg(entry)
+        .output()
+        .expect("runtime process should start");
+
+    assert!(
+        output.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "from async io"
+    );
+}
+
+#[test]
 fn starts_persistent_repl_when_no_script_is_given() {
     let mut child = runtime()
         .stdin(Stdio::piped())
@@ -59,6 +214,37 @@ fn starts_persistent_repl_when_no_script_is_given() {
 
     assert!(output.status.success());
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
+}
+
+#[test]
+fn services_timers_while_repl_waits_for_input() {
+    let mut child = runtime()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("runtime process should start");
+    let mut stdin = child.stdin.take().expect("REPL stdin should be available");
+    stdin
+        .write_all(b"setTimeout(() => console.log('timer-fired'), 20);\n")
+        .expect("REPL input should be written");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    stdin
+        .write_all(b".exit\n")
+        .expect("REPL exit command should be written");
+    drop(stdin);
+
+    let output = child
+        .wait_with_output()
+        .expect("runtime should finish after REPL exit");
+
+    assert!(
+        output.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("timer-fired"));
 }
 
 #[test]

@@ -220,16 +220,23 @@
   }
 
   const fsModule = (() => {
+    const createFsError = (result, path) => {
+      const error = new Error(result.error.message);
+      error.code = result.error.code;
+      error.path = path;
+      return error;
+    };
     const call = (operation, path, data) => {
       const result = JSON.parse(__runtimeFs(operation, path, JSON.stringify(data)));
-      if (result.error) {
-        const error = new Error(result.error.message);
-        error.code = result.error.code;
-        error.path = path;
-        throw error;
-      }
+      if (result.error) throw createFsError(result, path);
       return result.value;
     };
+    const asyncCall = (operation, path, data) =>
+      __runtimeFsAsync(operation, path, data === undefined ? "" : JSON.stringify(data)).then((encoded) => {
+        const result = JSON.parse(encoded);
+        if (result.error) throw createFsError(result, path);
+        return result.value;
+      });
     const fs = {
       readFileSync(path, options) {
         const encoding = typeof options === "string" ? options : options && options.encoding;
@@ -304,8 +311,52 @@
       };
     }
     for (const name of ["readFile", "writeFile", "appendFile", "readdir", "mkdir", "unlink", "rename", "stat", "lstat", "access", "copyFile", "truncate", "chmod", "realpath", "readlink", "rm", "rmdir"]) {
-      const syncName = `${name}Sync`;
-      fs.promises[name] = (...args) => Promise.resolve().then(() => fs[syncName](...args));
+      fs.promises[name] = (...args) => {
+        const path = String(args[0]);
+        switch (name) {
+          case "readFile": {
+            const options = args[1];
+            const encoding = typeof options === "string" ? options : options && options.encoding;
+            return asyncCall("readFile", path).then((bytes) => {
+              const buffer = Buffer.from(bytes);
+              return encoding ? buffer.toString(encoding) : buffer;
+            });
+          }
+          case "writeFile":
+            return asyncCall("writeFile", path, Buffer.from(args[1]).toJSON().data);
+          case "appendFile":
+            return asyncCall("appendFile", path, Buffer.from(args[1]).toJSON().data);
+          case "mkdir":
+            return asyncCall(args[1] && args[1].recursive ? "mkdirRecursive" : "mkdir", path);
+          case "unlink":
+            return asyncCall("unlink", path);
+          case "rename":
+            return asyncCall("rename", path, String(args[1]));
+          case "stat":
+          case "lstat":
+            return asyncCall(name, path).then(createStats);
+          case "access":
+            return asyncCall("access", path);
+          case "copyFile":
+            return asyncCall("copyFile", path, String(args[1]));
+          case "truncate":
+            return asyncCall("truncate", path, Number(args[1] ?? 0));
+          case "chmod":
+            return asyncCall("chmod", path, Number(args[1]));
+          case "realpath":
+            return asyncCall("realpath", path);
+          case "readlink":
+            return asyncCall("readlink", path);
+          case "rm":
+            return asyncCall(args[1] && args[1].recursive ? "removeDirRecursive" : "removeFile", path);
+          case "rmdir":
+            return asyncCall(args[1] && args[1].recursive ? "removeDirRecursive" : "removeDir", path);
+          case "readdir":
+            return asyncCall("readdir", path);
+          default:
+            return Promise.reject(new Error(`Unsupported filesystem operation '${name}'`));
+        }
+      };
       fs[name] = (...args) => {
         const callback = args.pop();
         if (typeof callback !== "function") {
@@ -319,7 +370,10 @@
     }
     fs.exists = (path, callback) => {
       if (typeof callback !== "function") throw new TypeError("The callback must be of type function");
-      Promise.resolve().then(() => callback(fs.existsSync(path)));
+      asyncCall("exists", String(path)).then(
+        (exists) => callback(exists),
+        () => callback(false),
+      );
     };
     return fs;
   })();
@@ -988,26 +1042,60 @@
   globalThis.clearImmediate = (timer) => { if (timer) timer.active = false; };
   globalThis.queueMicrotask ||= (callback) => Promise.resolve().then(callback);
 
-  globalThis.__runtimeDrainTasks = () => {
-    while (processNextTick.length || immediates.length || timers.some((timer) => timer.active)) {
-      while (processNextTick.length) processNextTick.shift()();
-      while (immediates.length) {
-        const immediate = immediates.shift();
-        if (immediate.active) immediate.callback(...immediate.args);
-        while (processNextTick.length) processNextTick.shift()();
-      }
-      let next = null;
-      for (const timer of timers) {
-        if (timer.active && (!next || timer.due < next.due)) next = timer;
-      }
-      if (next) {
-        const wait = Math.max(0, next.due - Date.now());
-        if (wait) __runtimeSleep(wait);
-        if (next.active) next.callback(...next.args);
-        if (next.interval && next.active) next.due = Date.now() + next.interval;
-        else next.active = false;
-        while (processNextTick.length) processNextTick.shift()();
-      }
+  const drainNextTicks = () => {
+    while (processNextTick.length) processNextTick.shift()();
+  };
+  const hasPendingWork = () =>
+    processNextTick.length > 0 ||
+    immediates.some((immediate) => immediate.active) ||
+    timers.some((timer) => timer.active) ||
+    __runtimeHasPendingAsync();
+  globalThis.__runtimeHasPendingWork = hasPendingWork;
+  globalThis.__runtimeRunEventLoopTurn = (maxWait = 0, waitWhenIdle = false) => {
+    drainNextTicks();
+    const readyImmediates = immediates.splice(0);
+    for (const immediate of readyImmediates) {
+      if (immediate.active) immediate.callback(...immediate.args);
+      immediate.active = false;
+      drainNextTicks();
     }
+
+    const runDueTimers = () => {
+      let now = Date.now();
+      const dueTimers = timers
+        .filter((timer) => timer.active && timer.due <= now)
+        .sort((a, b) => a.due - b.due || a.id - b.id);
+      for (const timer of dueTimers) {
+        if (!timer.active) continue;
+        if (timer.interval) timer.due = now + timer.interval;
+        else timer.active = false;
+        timer.callback(...timer.args);
+        drainNextTicks();
+        now = Date.now();
+      }
+      for (let index = timers.length - 1; index >= 0; index--) {
+        if (!timers[index].active) timers.splice(index, 1);
+      }
+    };
+
+    runDueTimers();
+    let pending = hasPendingWork();
+    if (!pending && !waitWhenIdle) return false;
+
+    const deadline = Date.now() + Math.max(0, Number(maxWait) || 0);
+    let nextTimer = null;
+    for (const timer of timers) {
+      if (timer.active && (!nextTimer || timer.due < nextTimer.due)) nextTimer = timer;
+    }
+    const timerWait = nextTimer ? Math.max(0, nextTimer.due - Date.now()) : Infinity;
+    const wait = Math.min(Math.max(0, deadline - Date.now()), timerWait);
+    if (wait > 0 && __runtimeHasPendingAsync()) __runtimePumpAsync(wait);
+    else if (wait > 0 && nextTimer) __runtimeSleep(wait);
+    else if (wait > 0 && waitWhenIdle && !pending) __runtimeSleep(wait);
+
+    runDueTimers();
+    drainNextTicks();
+    pending = hasPendingWork();
+    return pending;
   };
 })();

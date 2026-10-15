@@ -22,24 +22,28 @@ for Node.js**. The current implementation includes:
   imports, and CommonJS default/named interoperation. Package `import` and
   `require` export conditions are selected separately; CommonJS can
   synchronously `require()` ES module graphs without top-level await.
-- Synchronous filesystem methods for common file operations (plus callback and
-  promise-shaped wrappers), a small `path` implementation, and a partial
-  `Buffer` implementation.
+- Synchronous and Tokio-worker-backed asynchronous filesystem operations for a
+  subset of common file operations, including callback and Promise APIs; a
+  small `path` implementation and a partial `Buffer` implementation.
 - Basic `console`, `process.argv`, platform/architecture, current-directory and
   environment helpers, `process.nextTick`, timeout/interval/immediate queues,
   a basic event emitter, minimal stream classes, and a line-oriented persistent
   REPL with expression results and `.help`/`.exit` commands.
+- A turn-based event-loop pump that progresses next-tick/immediate/timer work
+  alongside async filesystem completions; the REPL continues servicing work
+  while waiting for input, and ES modules can await filesystem Promises.
 
 The compatibility layers are incomplete and have observable differences from
 Node. Native module linking does not yet implement every Node resolution rule,
 all import-attribute forms, complete CommonJS named-export detection, or the
-entire built-in-module namespace. The libuv event loop, true asynchronous
-I/O, complete filesystem and networking APIs, production-grade streams and
-workers, npm install behavior, advanced REPL features, and native addons are
-also not implemented. Timer and stream
-scheduling is a limited synchronous approximation, not Node's event loop.
-Several built-in module names resolve but are not implemented. Do not use this
-runtime as a drop-in Node replacement yet.
+entire built-in-module namespace. The event loop is a small turn-based pump,
+not libuv: asynchronous filesystem work runs on Tokio's blocking pool, and
+networking, general asynchronous handles, complete filesystem semantics,
+production-grade streams and workers, npm install behavior, advanced REPL
+features, and native addons are not implemented. Timer phase ordering and
+error handling also differ from Node. Several built-in module names resolve
+but are not implemented. Do not use this runtime as a drop-in Node replacement
+yet.
 
 ## Build
 

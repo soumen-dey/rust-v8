@@ -295,7 +295,7 @@ pub(crate) unsafe fn execute(
     };
 
     let result = if let Some(promise) = evaluation {
-        execute_script(scope, "__runtimeDrainTasks()", "<event loop>").and_then(|()| {
+        crate::drain_event_loop(scope).and_then(|()| {
             let handle_scope = &mut v8::HandleScope::new(scope);
             let promise = Local::new(handle_scope, &promise);
             match promise.state() {
@@ -803,24 +803,6 @@ fn caught_exception(
         .map(|value| value.to_rust_string_lossy(try_catch))
         .unwrap_or_else(|| "no JavaScript exception details available".to_owned());
     format!("JavaScript {phase} failed in {filename}: {detail}")
-}
-
-fn execute_script(
-    scope: &mut v8::ContextScope<'_, v8::HandleScope<'_>>,
-    source: &str,
-    filename: &str,
-) -> Result<(), String> {
-    let handle_scope = &mut v8::HandleScope::new(scope);
-    let try_catch = &mut v8::TryCatch::new(handle_scope);
-    let code = v8::String::new(try_catch, source)
-        .ok_or_else(|| format!("could not allocate JavaScript source for {filename}"))?;
-    let script = v8::Script::compile(try_catch, code, None)
-        .ok_or_else(|| caught_exception(try_catch, "compilation", filename))?;
-    if script.run(try_catch).is_some() {
-        Ok(())
-    } else {
-        Err(caught_exception(try_catch, "execution", filename))
-    }
 }
 
 pub unsafe extern "C" fn initialize_import_meta(
