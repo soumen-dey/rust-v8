@@ -363,16 +363,16 @@
           throw new TypeError(`The "${name}" callback must be of type function`);
         }
         fs.promises[name](...args).then(
-          (value) => callback(null, value),
-          (error) => callback(error),
+          (value) => process.nextTick(() => callback(null, value)),
+          (error) => process.nextTick(() => callback(error)),
         );
       };
     }
     fs.exists = (path, callback) => {
       if (typeof callback !== "function") throw new TypeError("The callback must be of type function");
       asyncCall("exists", String(path)).then(
-        (exists) => callback(exists),
-        () => callback(false),
+        (exists) => process.nextTick(() => callback(exists)),
+        () => process.nextTick(() => callback(false)),
       );
     };
     return fs;
@@ -641,18 +641,24 @@
 
   process._events = Object.create(null);
   Object.setPrototypeOf(process, EventEmitter.prototype);
-  const signalNumbers = {
-    SIGHUP: 1,
-    SIGINT: 2,
-    SIGTERM: 15,
-  };
-  if (process.platform === "win32") {
-    signalNumbers.SIGBREAK = 21;
-  } else if (process.platform === "darwin") {
-    Object.assign(signalNumbers, { SIGUSR1: 30, SIGUSR2: 31, SIGWINCH: 28 });
-  } else {
-    Object.assign(signalNumbers, { SIGUSR1: 10, SIGUSR2: 12, SIGWINCH: 28 });
-  }
+  const signalNumbers = process.platform === "win32"
+    ? { SIGINT: 2, SIGILL: 4, SIGFPE: 8, SIGSEGV: 11, SIGTERM: 15, SIGBREAK: 21, SIGABRT: 22 }
+    : process.platform === "darwin"
+      ? {
+          SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6,
+          SIGEMT: 7, SIGFPE: 8, SIGBUS: 10, SIGSEGV: 11, SIGSYS: 12, SIGPIPE: 13,
+          SIGALRM: 14, SIGTERM: 15, SIGURG: 16, SIGTSTP: 18, SIGCONT: 19, SIGCHLD: 20,
+          SIGTTIN: 21, SIGTTOU: 22, SIGIO: 23, SIGXCPU: 24, SIGXFSZ: 25, SIGVTALRM: 26,
+          SIGPROF: 27, SIGWINCH: 28, SIGINFO: 29, SIGUSR1: 30, SIGUSR2: 31,
+        }
+      : {
+          SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6,
+          SIGBUS: 7, SIGFPE: 8, SIGUSR1: 10, SIGSEGV: 11, SIGUSR2: 12, SIGPIPE: 13,
+          SIGALRM: 14, SIGTERM: 15, SIGSTKFLT: 16, SIGCHLD: 17, SIGCONT: 18,
+          SIGTSTP: 20, SIGTTIN: 21, SIGTTOU: 22, SIGURG: 23, SIGXCPU: 24,
+          SIGXFSZ: 25, SIGVTALRM: 26, SIGPROF: 27, SIGWINCH: 28, SIGIO: 29,
+          SIGPWR: 30, SIGSYS: 31,
+        };
   const watchSignalIfNeeded = (name) => {
     if (Object.prototype.hasOwnProperty.call(signalNumbers, name)) {
       __runtimeWatchSignal(name, signalNumbers[name], process.listenerCount(name) > 0);
@@ -685,11 +691,21 @@
     return result;
   };
   process.exitCode = 0;
+  let processExitEmitted = false;
+  const emitProcessExit = () => {
+    if (processExitEmitted) return;
+    processExitEmitted = true;
+    process.emit("exit", Number(process.exitCode) || 0);
+  };
   process.exit = (code = process.exitCode) => {
     const value = Number(code);
     if (!Number.isFinite(value)) throw new TypeError("The exit code must be a finite number");
     process.exitCode = ((Math.trunc(value) % 256) + 256) % 256;
-    __runtimeRequestExit(process.exitCode);
+    try {
+      emitProcessExit();
+    } finally {
+      __runtimeRequestExit(Number(process.exitCode) || 0);
+    }
   };
 
   class Readable extends EventEmitter {
@@ -1117,6 +1133,7 @@
   const drainNextTicks = () => {
     while (processNextTick.length) processNextTick.shift()();
   };
+  globalThis.__runtimeDrainNextTicks = drainNextTicks;
   const hasPendingWork = () =>
     processNextTick.length > 0 ||
     immediates.some((immediate) => immediate.active) ||
@@ -1124,11 +1141,14 @@
   globalThis.__runtimeHasPendingWork = hasPendingWork;
   globalThis.__runtimeRunEventLoopTurn = (maxWait = 0, waitWhenIdle = false) => {
     drainNextTicks();
-    const readyImmediates = immediates.splice(0);
-    for (const immediate of readyImmediates) {
-      if (immediate.active) immediate.callback(...immediate.args);
+    let readyCount = immediates.length;
+    while (readyCount-- > 0) {
+      const immediate = immediates.shift();
+      if (!immediate.active) continue;
+      immediate.callback(...immediate.args);
       immediate.active = false;
       drainNextTicks();
+      return hasPendingWork();
     }
 
     let pending = hasPendingWork();
@@ -1171,8 +1191,13 @@
       process.emit("rejectionHandled", promise);
     }
   };
+  globalThis.__runtimeHandleUncaughtException = (error, origin) => {
+    if (!process.listenerCount("uncaughtException")) return false;
+    process.emit("uncaughtException", error, origin);
+    return true;
+  };
   globalThis.__runtimeFinalizeProcess = () => {
-    process.emit("exit", Number(process.exitCode) || 0);
+    emitProcessExit();
     return Number(process.exitCode) || 0;
   };
 })();

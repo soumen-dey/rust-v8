@@ -1,7 +1,8 @@
 use crate::fs_operation;
 use libuv::HandleTrait;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::io::Write;
 use std::sync::{mpsc, Arc, Mutex};
 use v8::{Global, HandleScope, Local, PromiseResolver};
 
@@ -25,9 +26,9 @@ pub struct AsyncIo {
     receiver: mpsc::Receiver<LoopEvent>,
     pending: HashMap<u64, Global<PromiseResolver>>,
     next_id: u64,
+    queued_events: VecDeque<LoopEvent>,
     timers: HashMap<u64, libuv::TimerHandle>,
     signals: HashMap<String, libuv::SignalHandle>,
-    exit_code: Option<i32>,
     pending_rejections: Vec<(Global<v8::Promise>, Global<v8::Value>)>,
     pending_rejection_handled: Vec<Global<v8::Promise>>,
 }
@@ -47,9 +48,9 @@ impl AsyncIo {
             receiver,
             pending: HashMap::new(),
             next_id: 1,
+            queued_events: VecDeque::new(),
             timers: HashMap::new(),
             signals: HashMap::new(),
-            exit_code: None,
             pending_rejections: Vec::new(),
             pending_rejection_handled: Vec::new(),
         })
@@ -70,10 +71,6 @@ impl AsyncIo {
 
     pub fn has_pending(&self) -> bool {
         !self.pending.is_empty() || !self.timers.is_empty() || !self.signals.is_empty()
-    }
-
-    pub fn exit_code(&self) -> Option<i32> {
-        self.exit_code
     }
 
     fn track_promise_rejection(
@@ -232,37 +229,50 @@ impl AsyncIo {
     }
 
     fn pump(&mut self, scope: &mut HandleScope, timeout_ms: u64) -> Result<Vec<Value>, String> {
-        if timeout_ms == 0 && !self.event_loop.is_alive() {
+        let has_queued_events = !self.queued_events.is_empty();
+        if !has_queued_events && timeout_ms == 0 && !self.event_loop.is_alive() {
             return Ok(Vec::new());
         }
 
-        if timeout_ms > 0 {
+        if !has_queued_events && timeout_ms > 0 {
             self.wait_timer
                 .start(timeout_ms, 0, |_| {})
                 .map_err(|error| format!("could not start libuv wait timer: {error}"))?;
         }
 
-        self.event_loop
-            .run(if timeout_ms == 0 {
+        let run_result = self
+            .event_loop
+            .run(if has_queued_events || timeout_ms == 0 {
                 libuv::RunMode::NoWait
             } else {
                 libuv::RunMode::Once
-            })
-            .map_err(|error| format!("libuv event loop failed: {error}"))?;
+            });
 
-        if self.wait_timer.is_active() {
-            self.wait_timer
-                .stop()
-                .map_err(|error| format!("could not stop libuv wait timer: {error}"))?;
+        let stop_result = if self.wait_timer.is_active() {
+            self.wait_timer.stop()
+        } else {
+            Ok(())
+        };
+        match (run_result, stop_result) {
+            (Err(run_error), Err(stop_error)) => {
+                return Err(format!(
+                    "libuv event loop failed: {run_error}; could not stop wait timer: {stop_error}"
+                ));
+            }
+            (Err(error), _) => return Err(format!("libuv event loop failed: {error}")),
+            (_, Err(error)) => {
+                return Err(format!("could not stop libuv wait timer: {error}"));
+            }
+            (Ok(_), Ok(())) => {}
         }
 
+        self.queued_events.extend(self.receiver.try_iter());
         let mut events = Vec::new();
-        let received = self.receiver.try_iter().collect::<Vec<_>>();
-        for event in received {
+        if let Some(event) = self.queued_events.pop_front() {
             match event {
                 LoopEvent::Completion(completion) => {
                     let Some(resolver) = self.pending.remove(&completion.id) else {
-                        continue;
+                        return Ok(events);
                     };
                     let encoded = serde_json::to_string(&completion.result)
                         .map_err(|error| format!("could not encode async I/O result: {error}"))?;
@@ -413,39 +423,18 @@ pub fn request_exit(
     args: v8::FunctionCallbackArguments,
     _return_value: v8::ReturnValue,
 ) {
-    let code = args.get(0).integer_value(scope).unwrap_or(0) as i32;
-    let pointer = scope
-        .get_current_context()
-        .get_aligned_pointer_from_embedder_data(ASYNC_IO_SLOT);
-    if pointer.is_null() {
-        return;
+    let code = args
+        .get(0)
+        .integer_value(scope)
+        .unwrap_or(0)
+        .rem_euclid(256) as i32;
+    if let Err(error) = std::io::stdout().flush() {
+        eprintln!("node: could not flush stdout before process.exit(): {error}");
     }
-    unsafe { &mut *pointer.cast::<AsyncIo>() }.exit_code = Some(code);
-    let Some(message) = v8::String::new(scope, "process.exit was called") else {
-        return;
-    };
-    let exception = v8::Exception::error(scope, message);
-    if let Ok(error) = v8::Local::<v8::Object>::try_from(exception) {
-        if let Some(key) = v8::String::new(scope, "name") {
-            if let Some(value) = v8::String::new(scope, "RuntimeExit") {
-                let _ = error.set(scope, key.into(), value.into());
-            }
-        }
+    if let Err(error) = std::io::stderr().flush() {
+        eprintln!("node: could not flush stderr before process.exit(): {error}");
     }
-    scope.throw_exception(exception);
-}
-
-pub fn is_exit_requested(
-    scope: &mut HandleScope,
-    _args: v8::FunctionCallbackArguments,
-    mut return_value: v8::ReturnValue,
-) {
-    let pointer = scope
-        .get_current_context()
-        .get_aligned_pointer_from_embedder_data(ASYNC_IO_SLOT);
-    let requested =
-        !pointer.is_null() && unsafe { &*pointer.cast::<AsyncIo>() }.exit_code.is_some();
-    return_value.set(v8::Boolean::new(scope, requested).into());
+    std::process::exit(code);
 }
 
 pub fn pump(

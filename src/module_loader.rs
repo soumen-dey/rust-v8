@@ -288,34 +288,60 @@ pub(crate) unsafe fn execute(
                 Some(value) => value,
                 None => return Err(caught_exception(try_catch, "module evaluation", filename)),
             };
-            v8::Local::<v8::Promise>::try_from(evaluated)
-                .ok()
-                .map(|promise| Global::new(try_catch, promise))
+            let promise = v8::Local::<v8::Promise>::try_from(evaluated)
+                .map_err(|_| format!("module evaluation did not return a Promise: {filename}"))?;
+            let rejection_handler = v8::Function::new(try_catch, ignore_module_rejection)
+                .ok_or_else(|| "could not create module rejection handler".to_owned())?;
+            if promise.catch(try_catch, rejection_handler).is_none() {
+                return Err(format!(
+                    "could not attach module evaluation rejection handler: {filename}"
+                ));
+            }
+            Some(Global::new(try_catch, promise))
         }
     };
 
     let result = if let Some(promise) = evaluation {
-        crate::drain_event_loop(scope).and_then(|()| {
+        crate::drain_event_loop(scope)?;
+        let (reason, detail) = {
             let handle_scope = &mut v8::HandleScope::new(scope);
             let promise = Local::new(handle_scope, &promise);
             match promise.state() {
-                v8::PromiseState::Fulfilled => Ok(()),
-                v8::PromiseState::Rejected => Err(format!(
-                    "JavaScript module evaluation failed in {filename}: {}",
-                    promise
-                        .result(handle_scope)
-                        .to_rust_string_lossy(handle_scope)
-                )),
-                v8::PromiseState::Pending => Err(format!(
-                    "Top-level await in {filename} did not settle before the event loop became idle"
-                )),
+                v8::PromiseState::Fulfilled => return Ok(()),
+                v8::PromiseState::Rejected => {
+                    let reason = promise.result(handle_scope);
+                    (
+                        Global::new(handle_scope, reason),
+                        format!(
+                            "JavaScript module evaluation failed in {filename}: {}",
+                            reason.to_rust_string_lossy(handle_scope)
+                        ),
+                    )
+                }
+                v8::PromiseState::Pending => {
+                    return Err(format!(
+                        "Top-level await in {filename} did not settle before the event loop became idle"
+                    ))
+                }
             }
-        })
+        };
+        if crate::dispatch_uncaught_exception(scope, reason, "uncaughtException")? {
+            Ok(())
+        } else {
+            Err(detail)
+        }
     } else {
         Ok(())
     };
 
     result
+}
+
+fn ignore_module_rejection(
+    _scope: &mut HandleScope,
+    _args: v8::FunctionCallbackArguments,
+    _return_value: v8::ReturnValue,
+) {
 }
 
 fn resolve_callback<'s>(

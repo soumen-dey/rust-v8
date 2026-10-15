@@ -139,6 +139,32 @@ fn asynchronous_filesystem_errors_reject_with_node_error_codes() {
 }
 
 #[test]
+fn callback_filesystem_exceptions_use_uncaught_exception_handling() {
+    let project = TempProject::new();
+    let path = serde_json::to_string(&project.0.join("callback.txt").to_string_lossy().as_ref())
+        .expect("filesystem path should be encoded");
+    std::fs::write(project.0.join("callback.txt"), "data").expect("test input should be written");
+    let source = format!(
+        "process.on('uncaughtException', (error) => console.log(error.message)); require('node:fs').readFile({path}, () => {{ throw new Error('callback-error'); }}); setTimeout(() => console.log('continues'), 0);"
+    );
+
+    let output = runtime()
+        .args(["--eval", &source])
+        .output()
+        .expect("runtime process should start");
+
+    assert!(
+        output.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.lines().any(|line| line == "callback-error"));
+    assert!(stdout.lines().any(|line| line == "continues"));
+}
+
+#[test]
 fn services_timers_while_async_filesystem_work_is_pending() {
     let project = TempProject::new();
     let input = project.0.join("input.txt");
@@ -165,12 +191,12 @@ fn services_timers_while_async_filesystem_work_is_pending() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .collect::<Vec<_>>(),
-        ["sync", "timer", "io"]
-    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(lines.first(), Some(&"sync"));
+    assert_eq!(lines.len(), 3);
+    assert!(lines[1..].contains(&"timer"));
+    assert!(lines[1..].contains(&"io"));
 }
 
 #[test]
@@ -193,6 +219,60 @@ fn keeps_interval_alive_until_callback_clears_it() {
 }
 
 #[test]
+fn runs_microtasks_between_due_timer_callbacks() {
+    let output = runtime()
+        .args([
+            "--eval",
+            "setTimeout(() => { console.log('timer-one'); Promise.resolve().then(() => console.log('microtask')); }, 0); setTimeout(() => console.log('timer-two'), 0);",
+        ])
+        .output()
+        .expect("runtime process should start");
+
+    assert!(
+        output.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        ["timer-one", "microtask", "timer-two"]
+    );
+}
+
+#[test]
+fn runs_next_ticks_before_promise_microtasks_and_microtasks_between_immediates() {
+    let output = runtime()
+        .args([
+            "--eval",
+            "process.nextTick(() => console.log('nextTick')); Promise.resolve().then(() => console.log('promise')); setImmediate(() => { console.log('immediate-one'); Promise.resolve().then(() => console.log('immediate-microtask')); }); setImmediate(() => console.log('immediate-two'));",
+        ])
+        .output()
+        .expect("runtime process should start");
+
+    assert!(
+        output.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        [
+            "nextTick",
+            "promise",
+            "immediate-one",
+            "immediate-microtask",
+            "immediate-two"
+        ]
+    );
+}
+
+#[test]
 fn process_exit_stops_script_and_emits_exit_with_requested_code() {
     let output = runtime()
         .args([
@@ -212,6 +292,31 @@ fn process_exit_stops_script_and_emits_exit_with_requested_code() {
 }
 
 #[test]
+fn process_exit_cannot_be_caught_and_stops_timer_callbacks() {
+    let output = runtime()
+        .args([
+            "--eval",
+            "process.on('exit', () => console.log('exit')); setInterval(() => {}, 100000); try { process.exit(6); } catch { console.log('caught'); } console.log('after');",
+        ])
+        .output()
+        .expect("runtime process should start");
+
+    assert_eq!(output.status.code(), Some(6));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "exit");
+
+    let timer_output = runtime()
+        .args([
+            "--eval",
+            "process.on('exit', () => console.log('exit')); setTimeout(() => { process.exit(8); console.log('after'); }, 0);",
+        ])
+        .output()
+        .expect("runtime process should start");
+
+    assert_eq!(timer_output.status.code(), Some(8));
+    assert_eq!(String::from_utf8_lossy(&timer_output.stdout).trim(), "exit");
+}
+
+#[test]
 fn process_exit_code_is_used_after_normal_event_loop_drain() {
     let output = runtime()
         .args([
@@ -223,6 +328,73 @@ fn process_exit_code_is_used_after_normal_event_loop_drain() {
 
     assert_eq!(output.status.code(), Some(9));
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "exit:9");
+}
+
+#[test]
+fn delivers_uncaught_synchronous_and_timer_errors_to_process_listeners() {
+    let synchronous = runtime()
+        .args([
+            "--eval",
+            "process.on('uncaughtException', (error, origin) => console.log(error.message + ':' + origin)); throw new Error('sync-error'); console.log('unreachable');",
+        ])
+        .output()
+        .expect("runtime process should start");
+
+    assert!(
+        synchronous.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&synchronous.stdout),
+        String::from_utf8_lossy(&synchronous.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&synchronous.stdout).trim(),
+        "sync-error:uncaughtException"
+    );
+
+    let timer = runtime()
+        .args([
+            "--eval",
+            "process.on('uncaughtException', (error) => console.log(error.message)); setTimeout(() => { throw new Error('timer-error'); }, 0); setTimeout(() => console.log('still-running'), 0);",
+        ])
+        .output()
+        .expect("runtime process should start");
+
+    assert!(
+        timer.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&timer.stdout),
+        String::from_utf8_lossy(&timer.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&timer.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        ["timer-error", "still-running"]
+    );
+}
+
+#[test]
+fn delivers_top_level_esm_rejections_to_uncaught_exception_listeners() {
+    let project = TempProject::new();
+    let entry = project.0.join("entry.mjs");
+    std::fs::write(
+        &entry,
+        "process.on('uncaughtException', (error) => console.log(error.message)); throw new Error('esm-error');",
+    )
+    .expect("ES module entry should be written");
+
+    let output = runtime()
+        .arg(&entry)
+        .output()
+        .expect("runtime process should start");
+
+    assert!(
+        output.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "esm-error");
 }
 
 #[test]

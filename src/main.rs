@@ -95,6 +95,7 @@ fn run_repl() -> ExitCode {
 
     let (result, status) = {
         let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
+        isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
         isolate
             .set_host_initialize_import_meta_object_callback(module_loader::initialize_import_meta);
         isolate.set_host_import_module_dynamically_callback(module_loader::dynamic_import);
@@ -110,12 +111,7 @@ fn run_repl() -> ExitCode {
             .and_then(|()| {
                 execute_script(scope, include_str!("bootstrap.js"), "<runtime bootstrap>")
             })
-            .and_then(|()| repl_loop(scope, &async_io));
-        let result = if async_io.exit_code().is_some() {
-            Ok(())
-        } else {
-            result
-        };
+            .and_then(|()| repl_loop(scope));
         let (result, status) = match finalize_process(scope) {
             Ok(status) => (result, status),
             Err(error) => (Err(error), 1),
@@ -140,10 +136,7 @@ fn run_repl() -> ExitCode {
     }
 }
 
-fn repl_loop(
-    scope: &mut v8::ContextScope<'_, v8::HandleScope<'_>>,
-    async_io: &async_io::AsyncIo,
-) -> Result<(), String> {
+fn repl_loop(scope: &mut v8::ContextScope<'_, v8::HandleScope<'_>>) -> Result<(), String> {
     let interactive = io::stdin().is_terminal();
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
@@ -173,7 +166,6 @@ fn repl_loop(
                     _ => match execute_repl_input(scope, &input) {
                         Ok(Some(output)) => println!("{output}"),
                         Ok(None) => {}
-                        Err(_) if async_io.exit_code().is_some() => return Ok(()),
                         Err(error) => eprintln!("{error}"),
                     },
                 }
@@ -192,7 +184,6 @@ fn repl_loop(
             Ok(true) => {}
             Ok(false) if input_closed => return Ok(()),
             Ok(false) => {}
-            Err(_) if async_io.exit_code().is_some() => return Ok(()),
             Err(error) => eprintln!("{error}"),
         }
     }
@@ -272,6 +263,7 @@ fn run(source: &str, filename: &str, args: &[String], check_only: bool) -> ExitC
 
     let (result, status) = {
         let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
+        isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
         isolate
             .set_host_initialize_import_meta_object_callback(module_loader::initialize_import_meta);
         isolate.set_host_import_module_dynamically_callback(module_loader::dynamic_import);
@@ -324,11 +316,6 @@ fn run(source: &str, filename: &str, args: &[String], check_only: bool) -> ExitC
                     .and_then(|()| drain_event_loop(scope))
                 })
             }
-        };
-        let result = if async_io.exit_code().is_some() {
-            Ok(())
-        } else {
-            result
         };
         let finalized = if check_only {
             Ok(0)
@@ -463,12 +450,6 @@ fn install_globals(
     install_callback(
         scope,
         global,
-        "__runtimeIsExitRequested",
-        async_io::is_exit_requested,
-    )?;
-    install_callback(
-        scope,
-        global,
         "__runtimeHasPendingAsync",
         async_io::has_pending,
     )?;
@@ -515,19 +496,58 @@ fn execute_script(
     source: &str,
     filename: &str,
 ) -> Result<(), String> {
+    let failure = {
+        let handle_scope = &mut v8::HandleScope::new(scope);
+        let try_catch = &mut v8::TryCatch::new(handle_scope);
+        let code = v8::String::new(try_catch, source)
+            .ok_or_else(|| format!("could not allocate JavaScript source for {filename}"))?;
+        let script = match v8::Script::compile(try_catch, code, None) {
+            Some(script) => script,
+            None => return Err(caught_exception(try_catch, "compilation", filename)),
+        };
+        if script.run(try_catch).is_some() {
+            return Ok(());
+        }
+        let detail = caught_exception(try_catch, "execution", filename);
+        let exception = try_catch
+            .exception()
+            .map(|exception| v8::Global::new(try_catch, exception));
+        (exception, detail)
+    };
+    if let Some(exception) = failure.0 {
+        if dispatch_uncaught_exception(scope, exception, "uncaughtException")? {
+            return Ok(());
+        }
+    }
+    Err(failure.1)
+}
+
+pub(crate) fn dispatch_uncaught_exception(
+    scope: &mut v8::ContextScope<'_, v8::HandleScope<'_>>,
+    exception: v8::Global<v8::Value>,
+    origin: &str,
+) -> Result<bool, String> {
     let handle_scope = &mut v8::HandleScope::new(scope);
     let try_catch = &mut v8::TryCatch::new(handle_scope);
-    let code = v8::String::new(try_catch, source)
-        .ok_or_else(|| format!("could not allocate JavaScript source for {filename}"))?;
-    let script = match v8::Script::compile(try_catch, code, None) {
-        Some(script) => script,
-        None => return Err(caught_exception(try_catch, "compilation", filename)),
+    let context = try_catch.get_current_context();
+    let global = context.global(try_catch);
+    let key = v8::String::new(try_catch, "__runtimeHandleUncaughtException")
+        .ok_or_else(|| "could not create uncaught-exception handler key".to_owned())?;
+    let Some(handler) = global
+        .get(try_catch, key.into())
+        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+    else {
+        return Ok(false);
     };
-    if script.run(try_catch).is_some() {
-        Ok(())
-    } else {
-        Err(caught_exception(try_catch, "execution", filename))
-    }
+    let exception = v8::Local::new(try_catch, &exception);
+    let origin_value = v8::String::new(try_catch, origin)
+        .ok_or_else(|| "could not create uncaught-exception origin".to_owned())?;
+    let arguments = [exception, origin_value.into()];
+    let handled = handler
+        .call(try_catch, global.into(), &arguments)
+        .ok_or_else(|| caught_exception(try_catch, "uncaughtException handler", origin))?
+        .boolean_value(try_catch);
+    Ok(handled)
 }
 
 fn finalize_process(scope: &mut v8::ContextScope<'_, v8::HandleScope<'_>>) -> Result<u8, String> {
@@ -551,6 +571,7 @@ fn run_event_loop_turn(
     wait_ms: u64,
     wait_when_idle: bool,
 ) -> Result<bool, String> {
+    execute_script(scope, "__runtimeDrainNextTicks()", "<nextTick queue>")?;
     AsMut::<v8::Isolate>::as_mut(scope).perform_microtask_checkpoint();
     execute_script(
         scope,
@@ -559,17 +580,7 @@ fn run_event_loop_turn(
     )?;
     AsMut::<v8::Isolate>::as_mut(scope).perform_microtask_checkpoint();
     let source = format!("__runtimeRunEventLoopTurn({wait_ms}, {wait_when_idle})");
-    {
-        let handle_scope = &mut v8::HandleScope::new(scope);
-        let try_catch = &mut v8::TryCatch::new(handle_scope);
-        let code = v8::String::new(try_catch, &source)
-            .ok_or_else(|| "could not allocate event-loop turn".to_owned())?;
-        let script = v8::Script::compile(try_catch, code, None)
-            .ok_or_else(|| caught_exception(try_catch, "compilation", "<event loop>"))?;
-        script
-            .run(try_catch)
-            .ok_or_else(|| caught_exception(try_catch, "execution", "<event loop>"))?;
-    }
+    execute_script(scope, &source, "<event loop>")?;
     AsMut::<v8::Isolate>::as_mut(scope).perform_microtask_checkpoint();
     execute_script(
         scope,
@@ -602,6 +613,7 @@ fn drain_event_loop(scope: &mut v8::ContextScope<'_, v8::HandleScope<'_>>) -> Re
             continue;
         }
         execute_script(scope, "__runtimeEmitBeforeExit()", "<beforeExit event>")?;
+        execute_script(scope, "__runtimeDrainNextTicks()", "<nextTick queue>")?;
         AsMut::<v8::Isolate>::as_mut(scope).perform_microtask_checkpoint();
         execute_script(
             scope,

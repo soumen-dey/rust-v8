@@ -32,9 +32,11 @@ for Node.js**. The current implementation includes:
 - A libuv-backed event-loop wait/work queue with a JavaScript task scheduler
   for next-tick/immediate/timer callbacks; the REPL continues servicing work
   while waiting for input, and ES modules can await filesystem Promises.
-- Libuv-backed timeout/interval handles, selected process signal listeners,
-  `beforeExit`/`exit` lifecycle events, `process.exit()`/`process.exitCode`,
-  and unhandled-rejection reporting including `rejectionHandled`.
+- Libuv-backed timeout/interval handles, common platform-supported process signal listeners,
+  `setImmediate`/`process.nextTick` scheduling, explicit Promise microtask
+  checkpoints, `beforeExit`/`exit` lifecycle events,
+  `process.exit()`/`process.exitCode`, uncaught-exception listeners, and
+  unhandled-rejection reporting including `rejectionHandled`.
 
 The compatibility layers are incomplete and have observable differences from
 Node. Native module linking does not yet implement every Node resolution rule,
@@ -43,11 +45,15 @@ entire built-in-module namespace. The runtime now uses libuv for its loop,
 timer handles, timer-based waits, selected signal watchers, and thread-pool
 work requests, but it does not yet expose Node's complete libuv-backed handle
 and request APIs. Signal support is limited to selected signals and has not
-been validated on every operating system. Networking, DNS, filesystem
-watchers, child processes, complete filesystem semantics, production-grade
-streams and workers, npm install behavior, advanced REPL features, and native
-addons are not implemented. Timer phase ordering, uncaught-error behavior,
-and shutdown semantics also differ from Node. Several built-in module names
+been validated on every operating system. The uncaught-exception and Promise
+rejection lifecycle covers entry-script and event-loop execution, not every
+Node host callback. Explicit `process.exit()` flushes standard streams and terminates
+the host process immediately, bypassing Rust/V8 cleanup as Node's forced-exit
+behavior requires. Networking, DNS, filesystem watchers, child processes,
+complete filesystem semantics, production-grade streams and workers, npm
+install behavior, advanced REPL features, and native addons are not
+implemented. Timer phase ordering, error formatting, signal defaults, and
+normal shutdown behavior still differ from Node. Several built-in module names
 resolve but are not implemented. Do not use this runtime as a drop-in Node
 replacement yet.
 
