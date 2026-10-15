@@ -1,0 +1,33 @@
+# Rust build output
+/target/
+
+# JavaScript package installs and generated output
+/node_modules/
+**/node_modules/
+/dist/
+/coverage/
+
+# Runtime logs and diagnostic output
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary and backup files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~

@@ -1,0 +1,18 @@
+[package]
+name = "rust-node-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "A Rust-hosted JavaScript runtime embedding V8"
+license = "MIT"
+
+[package.metadata.node-compatibility]
+target = "24.22.0"
+v8-line = "13.6"
+
+[[bin]]
+name = "node"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+v8 = "=136.0.0"
