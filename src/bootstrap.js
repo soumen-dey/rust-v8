@@ -147,16 +147,20 @@
 
   function pathModule(windows = process.platform === "win32") {
     const sep = windows ? "\\" : "/";
-    const split = (value) => String(value).split(/[\\/]+/).filter(Boolean);
+    const split = (value) => String(value).split(windows ? /[\\/]+/ : /\/+/).filter(Boolean);
     const normalize = (value) => {
-      const absolute = value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value);
+      value = String(value);
+      const drive = windows ? /^([A-Za-z]:)/.exec(value)?.[1] : "";
+      const afterDrive = drive ? value.slice(drive.length) : value;
+      const absolute = afterDrive.startsWith("/") || (windows && afterDrive.startsWith("\\"));
       const parts = [];
-      for (const part of value.replace(/\\/g, "/").split("/")) {
+      const normalized = windows ? afterDrive.replace(/\\/g, "/") : afterDrive;
+      for (const part of normalized.split("/")) {
         if (!part || part === ".") continue;
         if (part === ".." && parts.length && parts[parts.length - 1] !== "..") parts.pop();
         else if (part !== ".." || !absolute) parts.push(part);
       }
-      const prefix = /^[A-Za-z]:/.exec(value)?.[0] || (absolute ? sep : "");
+      const prefix = drive ? `${drive}${absolute ? sep : ""}` : (absolute ? sep : "");
       const result = prefix + parts.join(sep);
       return result || (absolute ? sep : ".");
     };
@@ -178,10 +182,15 @@
         return suffix && base.endsWith(suffix) ? base.slice(0, -suffix.length) : base;
       },
       dirname(value) {
-        const parts = split(value);
-        parts.pop();
-        if (!parts.length) return value.startsWith("/") ? "/" : ".";
-        return (value.startsWith("/") ? sep : "") + parts.join(sep);
+        value = String(value);
+        const normalized = windows ? value.replace(/\//g, "\\") : value;
+        let end = normalized.length - 1;
+        while (end > 0 && normalized[end] === sep) end--;
+        const index = normalized.lastIndexOf(sep, end);
+        if (index < 0) return windows && /^[A-Za-z]:/.test(normalized) ? normalized.slice(0, 2) : ".";
+        if (index === 0) return sep;
+        if (windows && index === 2 && /^[A-Za-z]:/.test(normalized)) return normalized.slice(0, 3);
+        return normalized.slice(0, index);
       },
       extname(value) {
         const base = split(value).pop() || "";
@@ -189,7 +198,9 @@
         return index <= 0 ? "" : base.slice(index);
       },
       isAbsolute(value) {
-        return value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value);
+        return windows
+          ? /^[\\/]/.test(value) || /^[A-Za-z]:[\\/]/.test(value)
+          : value.startsWith("/");
       },
       join(...parts) {
         return normalize(parts.filter(Boolean).join(sep));
@@ -199,24 +210,237 @@
       relative(from, to) {
         const a = split(resolve(from));
         const b = split(resolve(to));
-        while (a.length && b.length && a[0].toLowerCase() === b[0].toLowerCase()) {
+        while (a.length && b.length && (windows ? a[0].toLowerCase() === b[0].toLowerCase() : a[0] === b[0])) {
           a.shift();
           b.shift();
         }
         return [...a.map(() => ".."), ...b].join(sep);
       },
       parse(value) {
-        const root = value.startsWith("/") ? sep : "";
+        const root = windows
+          ? (/^[A-Za-z]:[\\/]/.exec(value)?.[0] || (/^[\\/]/.test(value) ? sep : ""))
+          : (value.startsWith("/") ? sep : "");
         const base = this.basename(value);
         const ext = this.extname(base);
-        return { root, dir: this.dirname(value), base, ext, name: base.slice(0, base.length - ext.length) };
+        const dir = this.dirname(value);
+        return { root, dir: dir === "." ? "" : dir, base, ext, name: base.slice(0, base.length - ext.length) };
       },
       format(value) {
-        return `${value.dir || value.root || ""}${value.dir || value.root ? sep : ""}${value.name || ""}${value.ext || ""}`;
+        const dir = value.dir || value.root || "";
+        const base = value.base || `${value.name || ""}${value.ext || ""}`;
+        if (!dir) return base;
+        return dir === value.root ? `${dir}${base}` : `${dir}${sep}${base}`;
       },
       toNamespacedPath(value) {
         return String(value);
       },
+    };
+  }
+
+  function formDecode(value) {
+    return decodeURIComponent(value.replace(/\+/g, " "));
+  }
+
+  function formEncode(value) {
+    return encodeURIComponent(String(value))
+      .replace(/%20/g, "+")
+      .replace(/[!'()~]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+  }
+
+  class URLSearchParams {
+    constructor(init = "") {
+      this._entries = [];
+      if (typeof init === "string") {
+        for (const pair of init.replace(/^\?/, "").split("&")) {
+          if (!pair) continue;
+          const separator = pair.indexOf("=");
+          this._entries.push([
+            formDecode(separator < 0 ? pair : pair.slice(0, separator)),
+            formDecode(separator < 0 ? "" : pair.slice(separator + 1)),
+          ]);
+        }
+      } else if (Array.isArray(init) || (init && typeof init[Symbol.iterator] === "function")) {
+        for (const pair of init) {
+          if (!pair || pair.length !== 2) throw new TypeError("Each query pair must contain exactly two items");
+          this._entries.push([String(pair[0]), String(pair[1])]);
+        }
+      } else if (init && typeof init === "object") {
+        for (const key of Object.keys(init)) this._entries.push([key, String(init[key])]);
+      } else {
+        throw new TypeError("The URLSearchParams initializer must be a string, iterable, or record");
+      }
+    }
+    append(name, value) { this._entries.push([String(name), String(value)]); }
+    delete(name, value) {
+      name = String(name);
+      this._entries = this._entries.filter(([key, item]) => key !== name || (value !== undefined && item !== String(value)));
+    }
+    get(name) {
+      const entry = this._entries.find(([key]) => key === String(name));
+      return entry ? entry[1] : null;
+    }
+    getAll(name) { return this._entries.filter(([key]) => key === String(name)).map(([, value]) => value); }
+    has(name, value) {
+      return this._entries.some(([key, item]) => key === String(name) && (value === undefined || item === String(value)));
+    }
+    set(name, value) {
+      name = String(name);
+      value = String(value);
+      const index = this._entries.findIndex(([key]) => key === name);
+      if (index < 0) this._entries.push([name, value]);
+      else {
+        this._entries[index][1] = value;
+        this._entries = this._entries.filter((entry, entryIndex) => entry[0] !== name || entryIndex === index);
+      }
+    }
+    sort() {
+      this._entries = this._entries.map((entry, index) => ({ entry, index }))
+        .sort((a, b) => a.entry[0] < b.entry[0] ? -1 : a.entry[0] > b.entry[0] ? 1 : a.index - b.index)
+        .map(({ entry }) => entry);
+    }
+    forEach(callback, thisArg) {
+      for (const [name, value] of [...this._entries]) callback.call(thisArg, value, name, this);
+    }
+    *entries() { for (const entry of this._entries) yield [...entry]; }
+    *keys() { for (const [name] of this._entries) yield name; }
+    *values() { for (const [, value] of this._entries) yield value; }
+    [Symbol.iterator]() { return this.entries(); }
+    toString() { return this._entries.map(([name, value]) => `${formEncode(name)}=${formEncode(value)}`).join("&"); }
+  }
+
+  function normalizeUrlPath(path) {
+    const segments = [];
+    for (const segment of path.split("/")) {
+      if (segment === "." || /^%2e$/i.test(segment)) continue;
+      if (segment === ".." || /^(?:\.|%2e)(?:\.|%2e)$/i.test(segment)) segments.pop();
+      else segments.push(segment);
+    }
+    let normalized = segments.join("/");
+    if (path.startsWith("/") && !normalized.startsWith("/")) normalized = `/${normalized}`;
+    if (path.endsWith("/") && !normalized.endsWith("/")) normalized += "/";
+    return normalized || "/";
+  }
+
+  function parseUrl(input, base) {
+    const source = String(input).trim().replace(/[\t\r\n]/g, "");
+    const absoluteMatch = /^([A-Za-z][A-Za-z\d+.-]*:)(\/\/)?([^/?#]*)([^?#]*)(\?[^#]*)?(#.*)?$/.exec(source);
+    if (!absoluteMatch) {
+      if (!base) throw new TypeError(`Invalid URL: ${source}`);
+      const parent = parseUrl(base);
+      if (source.startsWith("//")) return parseUrl(`${parent.protocol}${source}`);
+      if (source.startsWith("#")) return { ...parent, hash: source };
+      if (source.startsWith("?")) return { ...parent, search: source, hash: "" };
+      if (!parent.hostname) throw new TypeError(`Invalid URL: ${source}`);
+      const path = source.startsWith("/") ? source : `${parent.pathname.slice(0, parent.pathname.lastIndexOf("/") + 1)}${source}`;
+      return { ...parent, pathname: normalizeUrlPath(path.split(/[?#]/, 1)[0]), search: source.match(/\?[^#]*/)?.[0] || "", hash: source.match(/#.*$/)?.[0] || "" };
+    }
+    const [, protocolRaw, slashMarker, authorityRaw, pathnameRaw, searchRaw = "", hashRaw = ""] = absoluteMatch;
+    const protocol = protocolRaw.toLowerCase();
+    const special = /^(https?|wss?|ftp|file):$/.test(protocol);
+    if (special && slashMarker !== "//") throw new TypeError(`Invalid URL: ${source}`);
+    let username = "";
+    let password = "";
+    let hostname = "";
+    let port = "";
+    if (slashMarker === "//") {
+      const at = authorityRaw.lastIndexOf("@");
+      const authority = at >= 0 ? authorityRaw.slice(at + 1) : authorityRaw;
+      if (at >= 0) {
+        const auth = authorityRaw.slice(0, at);
+        const colon = auth.indexOf(":");
+        username = colon < 0 ? auth : auth.slice(0, colon);
+        password = colon < 0 ? "" : auth.slice(colon + 1);
+      }
+      if (authority.startsWith("[")) {
+        const end = authority.indexOf("]");
+        if (end < 0) throw new TypeError(`Invalid URL: ${source}`);
+        hostname = authority.slice(0, end + 1).toLowerCase();
+        if (authority[end + 1] === ":") port = authority.slice(end + 2);
+        else if (authority.length !== end + 1) throw new TypeError(`Invalid URL: ${source}`);
+      } else {
+        const colon = authority.lastIndexOf(":");
+        hostname = (colon < 0 ? authority : authority.slice(0, colon)).toLowerCase();
+        if (colon >= 0) port = authority.slice(colon + 1);
+      }
+      if (special && protocol !== "file:" && !hostname) throw new TypeError(`Invalid URL: ${source}`);
+      if (port && (!/^\d+$/.test(port) || Number(port) > 65535)) throw new TypeError(`Invalid URL: ${source}`);
+      if ((protocol === "http:" && port === "80") || (protocol === "https:" && port === "443") ||
+          (protocol === "ws:" && port === "80") || (protocol === "wss:" && port === "443") ||
+          (protocol === "ftp:" && port === "21")) port = "";
+    }
+    const pathname = slashMarker === "//" ? normalizeUrlPath(pathnameRaw || "/") : pathnameRaw;
+    return { protocol, username, password, hostname, port, pathname, search: searchRaw, hash: hashRaw };
+  }
+
+  class URL {
+    constructor(input, base) {
+      this._state = parseUrl(input, base);
+      this.searchParams = new URLSearchParams(this._state.search);
+    }
+    get href() { return this.toString(); }
+    set href(value) { this._state = parseUrl(value); this._syncSearchParams(); }
+    get protocol() { return this._state.protocol; }
+    set protocol(value) {
+      const protocol = String(value).toLowerCase();
+      if (/^[a-z][a-z\d+.-]*:$/.test(protocol)) this._state.protocol = protocol;
+    }
+    get username() { return this._state.username; }
+    set username(value) { this._state.username = encodeURIComponent(String(value)); }
+    get password() { return this._state.password; }
+    set password(value) { this._state.password = encodeURIComponent(String(value)); }
+    get hostname() { return this._state.hostname; }
+    set hostname(value) { this._state.hostname = String(value).toLowerCase(); }
+    get port() { return this._state.port; }
+    set port(value) {
+      const port = String(value);
+      if (!port) { this._state.port = ""; return; }
+      if (/^\d+$/.test(port) && Number(port) <= 65535) this._state.port = port;
+    }
+    get host() { return this._state.hostname + (this._state.port ? `:${this._state.port}` : ""); }
+    set host(value) {
+      const parsed = parseUrl(`${this.protocol}//${value}/`);
+      this._state.hostname = parsed.hostname;
+      this._state.port = parsed.port;
+    }
+    get pathname() { return this._state.pathname; }
+    set pathname(value) { this._state.pathname = String(value).startsWith("/") ? String(value) : `/${value}`; }
+    get search() { return this._state.search; }
+    set search(value) {
+      const search = String(value);
+      this._state.search = search && search !== "?" ? (search.startsWith("?") ? search : `?${search}`) : "";
+      this._syncSearchParams();
+    }
+    get hash() { return this._state.hash; }
+    set hash(value) {
+      const hash = String(value);
+      this._state.hash = hash && hash !== "#" ? (hash.startsWith("#") ? hash : `#${hash}`) : "";
+    }
+    get origin() {
+      return /^(https?|wss?|ftp):$/.test(this.protocol) ? `${this.protocol}//${this.host}` : "null";
+    }
+    _syncSearchParams() { this.searchParams = new URLSearchParams(this._state.search); }
+    _updateSearch() { this._state.search = this.searchParams.toString() ? `?${this.searchParams}` : ""; }
+    toString() {
+      const auth = this.username || this.password ? `${this.username}${this.password ? `:${this.password}` : ""}@` : "";
+      const authority = this._state.hostname ? `//${auth}${this.host}` : this._state.protocol === "file:" ? "//" : "";
+      return `${this.protocol}${authority}${this.pathname}${this.search}${this.hash}`;
+    }
+    toJSON() { return this.toString(); }
+  }
+  Object.defineProperty(URL.prototype, "searchParams", {
+    configurable: true,
+    get() { return this._searchParams; },
+    set(value) {
+      this._searchParams = value;
+      value._onChange = () => this._updateSearch();
+    },
+  });
+  for (const method of ["append", "delete", "set", "sort"]) {
+    const original = URLSearchParams.prototype[method];
+    URLSearchParams.prototype[method] = function (...args) {
+      const result = original.apply(this, args);
+      if (this._onChange) this._onChange();
+      return result;
     };
   }
 
@@ -416,6 +640,15 @@
     return bytes;
   }
 
+  function encodeUtf16(value) {
+    const bytes = [];
+    for (let index = 0; index < value.length; index++) {
+      const code = value.charCodeAt(index);
+      bytes.push(code & 255, code >>> 8);
+    }
+    return bytes;
+  }
+
   function decodeUtf8(bytes) {
     let encoded = "";
     for (const byte of bytes) encoded += `%${byte.toString(16).padStart(2, "0")}`;
@@ -443,7 +676,7 @@
 
   function decodeBase64(value) {
     const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    const clean = String(value).replace(/[^A-Za-z0-9+/]/g, "");
+    const clean = String(value).replace(/-/g, "+").replace(/_/g, "/").replace(/[^A-Za-z0-9+/]/g, "");
     const bytes = [];
     let bits = 0;
     let accumulator = 0;
@@ -453,38 +686,62 @@
       if (bits >= 8) {
         bits -= 8;
         bytes.push((accumulator >> bits) & 255);
+        accumulator &= (1 << bits) - 1;
       }
     }
     return bytes;
   }
 
   class Buffer extends Uint8Array {
-    static from(value, encoding = "utf8") {
+    static from(value, encoding = "utf8", length) {
       if (typeof value === "string") {
+        encoding = normalizeBufferEncoding(encoding);
         if (encoding === "hex") {
           const bytes = [];
-          for (let i = 0; i + 1 < value.length; i += 2) bytes.push(parseInt(value.slice(i, i + 2), 16) || 0);
+          for (let i = 0; i + 1 < value.length; i += 2) {
+            const byte = value.slice(i, i + 2);
+            if (!/^[\da-f]{2}$/i.test(byte)) break;
+            bytes.push(parseInt(byte, 16));
+          }
           return new Buffer(bytes);
         }
         if (encoding === "base64" || encoding === "base64url") return new Buffer(decodeBase64(value));
         if (encoding === "ascii" || encoding === "latin1" || encoding === "binary") {
           return new Buffer(Array.from(value, (char) => char.charCodeAt(0) & 255));
         }
+        if (encoding === "ucs2") return new Buffer(encodeUtf16(value));
         return new Buffer(encodeUtf8(value));
       }
-      if (ArrayBuffer.isView(value)) return new Buffer(value);
-      if (value instanceof ArrayBuffer) return new Buffer(new Uint8Array(value));
+      if (value instanceof ArrayBuffer) {
+        const offset = encoding === undefined ? 0 : Number(encoding);
+        const byteLength = length === undefined ? value.byteLength - offset : Number(length);
+        if (!Number.isInteger(offset) || !Number.isInteger(byteLength) || offset < 0 || byteLength < 0 || offset + byteLength > value.byteLength) {
+          throw new RangeError("The byteOffset and length must be within the bounds of the buffer");
+        }
+        return new Buffer(value, offset, byteLength);
+      }
+      if (ArrayBuffer.isView(value)) {
+        if (value instanceof DataView) return new Buffer(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+        return new Buffer(value);
+      }
       if (Array.isArray(value)) return new Buffer(value);
       if (value && Array.isArray(value.data)) return new Buffer(value.data);
       throw new TypeError("The first argument must be a string, Buffer, ArrayBuffer, or array");
     }
     static alloc(size, fill = 0, encoding = "utf8") {
-      const buffer = new Buffer(Math.max(0, Number(size) | 0));
-      if (fill !== 0) buffer.fill(typeof fill === "string" ? Buffer.from(fill, encoding)[0] || 0 : fill);
+      size = Number(size);
+      if (!Number.isInteger(size) || size < 0 || size > 0x7fffffff) throw new RangeError("The value of \"size\" is out of range");
+      const buffer = new Buffer(size);
+      if (typeof fill === "string") {
+        const bytes = Buffer.from(fill, encoding);
+        if (bytes.length) for (let index = 0; index < buffer.length; index++) buffer[index] = bytes[index % bytes.length];
+      } else if (fill !== 0) {
+        buffer.fill(fill);
+      }
       return buffer;
     }
     static allocUnsafe(size) {
-      return new Buffer(Math.max(0, Number(size) | 0));
+      return Buffer.alloc(size);
     }
     static byteLength(value, encoding = "utf8") {
       return Buffer.from(value, encoding).length;
@@ -504,8 +761,15 @@
     static isBuffer(value) {
       return value instanceof Buffer;
     }
+    static isEncoding(encoding) {
+      try { normalizeBufferEncoding(encoding); return true; }
+      catch { return false; }
+    }
     toString(encoding = "utf8", start = 0, end = this.length) {
-      const bytes = this.subarray(Math.max(0, start), Math.min(this.length, end));
+      encoding = normalizeBufferEncoding(encoding);
+      start = Math.trunc(Number(start) || 0);
+      end = end === undefined ? this.length : Math.trunc(Number(end) || 0);
+      const bytes = this.subarray(start, end);
       if (encoding === "hex") return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
       if (encoding === "base64" || encoding === "base64url") {
         const result = encodeBase64(bytes);
@@ -513,6 +777,11 @@
       }
       if (encoding === "ascii") return Array.from(bytes, (byte) => String.fromCharCode(byte & 127)).join("");
       if (encoding === "latin1" || encoding === "binary") return Array.from(bytes, (byte) => String.fromCharCode(byte)).join("");
+      if (encoding === "ucs2") {
+        let output = "";
+        for (let index = 0; index + 1 < bytes.length; index += 2) output += String.fromCharCode(bytes[index] | (bytes[index + 1] << 8));
+        return output;
+      }
       return decodeUtf8(bytes);
     }
     equals(other) {
@@ -530,7 +799,10 @@
       return -1;
     }
     write(value, offset = 0, encoding = "utf8") {
+      encoding = normalizeBufferEncoding(encoding);
       const bytes = Buffer.from(value, encoding);
+      offset = Number(offset);
+      if (!Number.isInteger(offset) || offset < 0 || offset > this.length) throw new RangeError("The offset is out of range");
       const count = Math.min(bytes.length, this.length - offset);
       this.set(bytes.subarray(0, count), offset);
       return count;
@@ -540,7 +812,37 @@
     }
   }
 
+  function normalizeBufferEncoding(encoding) {
+    encoding = String(encoding).toLowerCase();
+    const aliases = { utf8: "utf8", "utf-8": "utf8", hex: "hex", base64: "base64", base64url: "base64url", ascii: "ascii", latin1: "latin1", binary: "latin1", ucs2: "ucs2", "ucs-2": "ucs2", utf16le: "ucs2", "utf-16le": "ucs2" };
+    const normalized = aliases[encoding];
+    if (!normalized) throw new TypeError(`Unknown encoding: ${encoding}`);
+    return normalized;
+  }
+
   globalThis.Buffer = Buffer;
+  globalThis.URL = URL;
+  globalThis.URLSearchParams = URLSearchParams;
+
+  function fileURLToPath(value) {
+    const url = value instanceof URL ? value : new URL(value);
+    if (url.protocol !== "file:") throw new TypeError("The URL must be of scheme file");
+    if (url.hostname && url.hostname !== "localhost") throw new TypeError("File URL host must be empty or localhost");
+    let pathname = decodeURIComponent(url.pathname);
+    if (process.platform === "win32") {
+      pathname = pathname.replace(/^\/([A-Za-z]:)/, "$1").replace(/\//g, "\\");
+    }
+    return pathname;
+  }
+
+  function pathToFileURL(value) {
+    let pathname = pathModule().resolve(String(value)).replace(/\\/g, "/");
+    if (/^[A-Za-z]:/.test(pathname)) pathname = `/${pathname}`;
+    const encoded = pathname.split("/").map((segment) => encodeURIComponent(segment).replace(/%3A/gi, ":")).join("/");
+    return new URL(`file://${encoded.startsWith("/") ? "" : "/"}${encoded}`);
+  }
+
+  const urlModule = { URL, URLSearchParams, fileURLToPath, pathToFileURL };
 
   function builtinModule(name) {
     switch (name) {
@@ -554,7 +856,9 @@
       case "fs/promises":
         return fsModule.promises;
       case "buffer":
-        return { Buffer, SlowBuffer: Buffer };
+        return { Buffer, SlowBuffer: Buffer, constants: { MAX_LENGTH: 0x7fffffff, MAX_STRING_LENGTH: 0x1fffffe8 } };
+      case "url":
+        return urlModule;
       case "process":
         return process;
       case "console":
@@ -608,8 +912,13 @@
   class EventEmitter {
     constructor() {
       this._events = Object.create(null);
+      this._maxListeners = undefined;
     }
     on(name, listener) {
+      if (typeof listener !== "function") throw new TypeError("The listener must be of type function");
+      if (name !== "newListener" && this.listenerCount("newListener")) {
+        this.emit("newListener", name, listener.listener || listener);
+      }
       (this._events[name] ||= []).push(listener);
       return this;
     }
@@ -635,28 +944,53 @@
     }
     removeListener(name, listener) {
       const listeners = this._events[name];
-      if (listeners) this._events[name] = listeners.filter((item) => item !== listener && item.listener !== listener);
+      if (!listeners) return this;
+      for (let index = listeners.length - 1; index >= 0; index--) {
+        const item = listeners[index];
+        if (item === listener || item.listener === listener) {
+          listeners.splice(index, 1);
+          if (!listeners.length) delete this._events[name];
+          if (name !== "removeListener") this.emit("removeListener", name, item.listener || item);
+          break;
+        }
+      }
       return this;
     }
     off(name, listener) {
       return this.removeListener(name, listener);
     }
     removeAllListeners(name) {
-      if (name === undefined) this._events = Object.create(null);
-      else delete this._events[name];
+      if (name !== undefined) {
+        for (const listener of this.rawListeners(name).reverse()) this.removeListener(name, listener);
+        return this;
+      }
+      if (!this.listenerCount("removeListener")) {
+        this._events = Object.create(null);
+        return this;
+      }
+      for (const eventName of this.eventNames()) {
+        if (eventName !== "removeListener") this.removeAllListeners(eventName);
+      }
+      this.removeAllListeners("removeListener");
       return this;
     }
     listeners(name) {
       return (this._events[name] || []).map((listener) => listener.listener || listener);
     }
+    rawListeners(name) {
+      return [...(this._events[name] || [])];
+    }
     listenerCount(name) {
       return (this._events[name] || []).length;
     }
-    setMaxListeners() {
+    setMaxListeners(count) {
+      count = Number(count);
+      if (!Number.isInteger(count) || count < 0) throw new RangeError("The value of \"n\" is out of range");
+      this._maxListeners = count;
       return this;
     }
     getMaxListeners() {
-      return 10;
+      return this._maxListeners === undefined ? EventEmitter.defaultMaxListeners : this._maxListeners;
     }
     eventNames() {
       return Reflect.ownKeys(this._events);
@@ -1033,10 +1367,18 @@
   EventEmitter.defaultMaxListeners = 10;
   EventEmitter.listenerCount = (emitter, name) => emitter.listenerCount(name);
   EventEmitter.prototype.prependListener = function (name, listener) {
+    if (typeof listener !== "function") throw new TypeError("The listener must be of type function");
+    if (name !== "newListener" && this.listenerCount("newListener")) {
+      this.emit("newListener", name, listener.listener || listener);
+    }
     (this._events[name] ||= []).unshift(listener);
     return this;
   };
   EventEmitter.prototype.prependOnceListener = function (name, listener) {
+    if (typeof listener !== "function") throw new TypeError("The listener must be of type function");
+    if (name !== "newListener" && this.listenerCount("newListener")) {
+      this.emit("newListener", name, listener);
+    }
     const wrapped = (...args) => {
       this.removeListener(name, wrapped);
       listener.apply(this, args);

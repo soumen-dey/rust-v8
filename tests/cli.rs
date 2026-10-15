@@ -1290,6 +1290,127 @@ fn exposes_basic_process_platform_information() {
 }
 
 #[test]
+fn exposes_process_executable_and_process_id() {
+    let output = runtime()
+        .args([
+            "--eval",
+            "console.log([process.execPath === process.argv0, process.pid > 0, process.argv[0] === process.execPath].join(':'));",
+        ])
+        .output()
+        .expect("runtime process should start");
+
+    assert!(
+        output.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "true:true:true"
+    );
+}
+
+#[test]
+fn supports_event_emitter_listener_lifecycle_and_max_listeners() {
+    let output = runtime()
+        .args([
+            "--eval",
+            "const { EventEmitter } = require('node:events'); const emitter = new EventEmitter(); const events = []; const listener = () => {}; emitter.on('newListener', (name) => events.push('new:' + name)); emitter.on('removeListener', (name) => events.push('remove:' + name)); emitter.once('work', listener); emitter.emit('work'); emitter.setMaxListeners(4); console.log([events.join(','), emitter.listenerCount('work'), emitter.getMaxListeners(), emitter.rawListeners('work').length].join('|'));",
+        ])
+        .output()
+        .expect("runtime process should start");
+
+    assert!(
+        output.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "new:removeListener,new:work,remove:work|0|4|0"
+    );
+}
+
+#[test]
+fn supports_url_and_url_search_params_core_operations() {
+    let output = runtime()
+        .args([
+            "--eval",
+            "const url = new URL('../c?x=1&x=2', 'https://example.com/a/b'); url.searchParams.set('x', '3'); url.searchParams.append('space key', 'hello world'); const urlApi = require('node:url'); console.log([url.href, url.origin, url.searchParams.getAll('x').join(','), url.searchParams.get('space key'), urlApi.fileURLToPath(urlApi.pathToFileURL(process.cwd())) === process.cwd()].join('|'));",
+        ])
+        .output()
+        .expect("runtime process should start");
+
+    assert!(
+        output.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "https://example.com/c?x=3&space+key=hello+world|https://example.com|3|hello world|true"
+    );
+}
+
+#[test]
+fn supports_url_named_esm_imports_and_path_root_formatting() {
+    let project = TempProject::new();
+    let entry = project.0.join("url-paths.mjs");
+    std::fs::write(
+        &entry,
+        concat!(
+            "import { URL } from 'node:url';\n",
+            "const query = new URLSearchParams('a=1&a=2');\n",
+            "import { format } from 'node:path/posix';\n",
+            "import { normalize, dirname } from 'node:path/win32';\n",
+            "console.log([new URL('/x', 'https://example.test/a').href, query.getAll('a').join(','), format({ root: '/', base: 'x' }), normalize('C:\\\\a\\\\..\\\\b'), dirname('C:\\\\file')].join('|'));\n",
+        ),
+    )
+    .expect("ES module should be written");
+
+    let output = runtime()
+        .arg(&entry)
+        .output()
+        .expect("runtime process should start");
+
+    assert!(
+        output.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "https://example.test/x|1,2|/x|C:\\b|C:\\"
+    );
+}
+
+#[test]
+fn supports_buffer_encoding_and_array_buffer_views() {
+    let output = runtime()
+        .args([
+            "--eval",
+            "const { Buffer } = require('node:buffer'); const source = new ArrayBuffer(4); const view = Buffer.from(source, 1, 2); view.set([65, 66]); console.log([new Uint8Array(source).join(','), Buffer.from('hi', 'ucs2').toString('ucs2'), Buffer.alloc(5, 'ab').toString(), Buffer.isEncoding('utf-16le'), Buffer.from([251, 255]).toString('base64url'), Buffer.from('-_8', 'base64url').join(',')].join('|'));",
+        ])
+        .output()
+        .expect("runtime process should start");
+
+    assert!(
+        output.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "0,65,66,0|hi|ababa|true|-_8|251,255"
+    );
+}
+
+#[test]
 fn returns_failure_for_invalid_javascript() {
     let output = runtime()
         .args(["--eval", "function ("])

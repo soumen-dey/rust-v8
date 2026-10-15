@@ -24,11 +24,16 @@ for Node.js**. The current implementation includes:
   synchronously `require()` ES module graphs without top-level await.
 - Synchronous and libuv-thread-pool-backed asynchronous filesystem operations
   for a subset of common file operations, including callback and Promise APIs;
-  a small `path` implementation and a partial `Buffer` implementation.
-- Basic `console`, `process.argv`, platform/architecture, current-directory and
-  environment helpers, `process.nextTick`, timeout/interval/immediate queues,
-  a basic event emitter, minimal stream classes, and a line-oriented persistent
-  REPL with expression results and `.help`/`.exit` commands.
+  a small `path` implementation and a partial `Buffer` implementation with
+  common encodings and ArrayBuffer views.
+- Basic `URL`/`URLSearchParams` support for common absolute and relative URLs,
+  query-string mutation, and `node:url` file URL conversions. This is not a
+  complete WHATWG URL implementation.
+- Basic `console`, `process.argv`, process executable path and ID,
+  platform/architecture, current-directory and environment helpers,
+  `process.nextTick`, timeout/interval/immediate queues, a basic event emitter,
+  minimal stream classes, and a line-oriented persistent REPL with expression
+  results and `.help`/`.exit` commands.
 - A libuv-backed event-loop wait/work queue with a JavaScript task scheduler
   for next-tick/immediate/timer callbacks; the REPL continues servicing work
   while waiting for input, and ES modules can await filesystem Promises.
@@ -51,11 +56,12 @@ Node host callback. Explicit `process.exit()` flushes standard streams and termi
 the host process immediately, bypassing Rust/V8 cleanup as Node's forced-exit
 behavior requires. Networking, DNS, filesystem watchers, child processes,
 complete filesystem semantics, production-grade streams and workers, npm
-install behavior, advanced REPL features, and native addons are not
-implemented. Timer phase ordering, error formatting, signal defaults, and
-normal shutdown behavior still differ from Node. Several built-in module names
-resolve but are not implemented. Do not use this runtime as a drop-in Node
-replacement yet.
+install behavior, crypto APIs, advanced REPL features, and native addons are
+not implemented. URL, Buffer, path, process, streams, and event APIs remain
+partial. Timer phase ordering, error formatting, signal defaults, and normal
+shutdown behavior still differ from Node. Several built-in module names resolve
+but are not implemented. Do not use this runtime as a drop-in Node replacement
+yet.
 
 ## Build
 

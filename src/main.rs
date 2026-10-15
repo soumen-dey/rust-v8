@@ -374,7 +374,7 @@ fn install_globals(
         .map_err(|error| format!("could not determine executable path: {error}"))?
         .to_string_lossy()
         .into_owned();
-    let mut process_args = vec![executable];
+    let mut process_args = vec![executable.clone()];
     if filename != "<eval>" {
         process_args.push(filename.to_owned());
     }
@@ -393,6 +393,10 @@ fn install_globals(
         }
     }
     set_object_property(scope, process, "argv", argv.into())?;
+    set_string_property(scope, process, "execPath", &executable)?;
+    set_string_property(scope, process, "argv0", &executable)?;
+    let pid = v8::Number::new(scope, std::process::id() as f64);
+    set_object_property(scope, process, "pid", pid.into())?;
     set_string_property(
         scope,
         process,
