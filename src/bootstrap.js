@@ -5,6 +5,7 @@
   const immediates = [];
   const timers = new Map();
   let nextTimerId = 1;
+  let inCheckPhase = false;
 
   function createRequire(parentFilename, importMode = false) {
     function requireModule(specifier) {
@@ -223,7 +224,10 @@
     const createFsError = (result, path) => {
       const error = new Error(result.error.message);
       error.code = result.error.code;
+      error.errno = result.error.errno;
       error.path = path;
+      error.syscall = result.error.syscall;
+      if (result.error.dest !== undefined) error.dest = result.error.dest;
       return error;
     };
     const call = (operation, path, data) => {
@@ -232,7 +236,11 @@
       return result.value;
     };
     const asyncCall = (operation, path, data) =>
-      __runtimeFsAsync(operation, path, data === undefined ? "" : JSON.stringify(data)).then((encoded) => {
+      __runtimeFsAsync(
+        operation,
+        path,
+        data === undefined ? "" : typeof data === "string" ? data : JSON.stringify(data),
+      ).then((encoded) => {
         const result = JSON.parse(encoded);
         if (result.error) throw createFsError(result, path);
         return result.value;
@@ -255,6 +263,9 @@
       mkdirSync(path, options) {
         return call(options && options.recursive ? "mkdirRecursive" : "mkdir", String(path));
       },
+      mkdtempSync(prefix) {
+        return call("mkdtemp", String(prefix));
+      },
       readdirSync(path) {
         return call("readdir", String(path));
       },
@@ -276,6 +287,13 @@
       },
       copyFileSync(source, destination) {
         return call("copyFile", String(source), String(destination));
+      },
+      linkSync(existingPath, newPath) {
+        return call("hardLink", String(existingPath), String(newPath));
+      },
+      symlinkSync(target, path, type) {
+        const operation = type === "dir" ? "symlinkDir" : "symlinkFile";
+        return call(operation, String(target), String(path));
       },
       truncateSync(path, length = 0) {
         return call("truncate", String(path), Number(length));
@@ -310,7 +328,7 @@
         isSocket: () => false,
       };
     }
-    for (const name of ["readFile", "writeFile", "appendFile", "readdir", "mkdir", "unlink", "rename", "stat", "lstat", "access", "copyFile", "truncate", "chmod", "realpath", "readlink", "rm", "rmdir"]) {
+    for (const name of ["readFile", "writeFile", "appendFile", "readdir", "mkdir", "mkdtemp", "unlink", "rename", "stat", "lstat", "access", "copyFile", "link", "symlink", "truncate", "chmod", "realpath", "readlink", "rm", "rmdir"]) {
       fs.promises[name] = (...args) => {
         const path = String(args[0]);
         switch (name) {
@@ -328,6 +346,8 @@
             return asyncCall("appendFile", path, Buffer.from(args[1]).toJSON().data);
           case "mkdir":
             return asyncCall(args[1] && args[1].recursive ? "mkdirRecursive" : "mkdir", path);
+          case "mkdtemp":
+            return asyncCall("mkdtemp", path);
           case "unlink":
             return asyncCall("unlink", path);
           case "rename":
@@ -339,6 +359,10 @@
             return asyncCall("access", path);
           case "copyFile":
             return asyncCall("copyFile", path, String(args[1]));
+          case "link":
+            return asyncCall("hardLink", path, String(args[1]));
+          case "symlink":
+            return asyncCall(args[2] === "dir" ? "symlinkDir" : "symlinkFile", path, String(args[1]));
           case "truncate":
             return asyncCall("truncate", path, Number(args[1] ?? 0));
           case "chmod":
@@ -1102,26 +1126,48 @@
   globalThis.setTimeout = (callback, delay = 1, ...args) => {
     if (typeof callback !== "function") throw new TypeError("The callback argument must be of type function");
     delay = Math.min(2_147_483_647, Math.max(1, Number(delay) || 1));
-    const timer = { id: nextTimerId++, callback, args, interval: 0, active: true };
+    const timer = { id: nextTimerId++, callback, args, delay, interval: 0, active: true };
     timers.set(timer.id, timer);
     __runtimeScheduleTimer(timer.id, delay, 0);
-    return timer;
+    return createTimerHandle(timer);
   };
   globalThis.clearTimeout = (timer) => {
-    if (!timer || !timer.active) return;
-    timer.active = false;
-    timers.delete(timer.id);
-    __runtimeCancelTimer(timer.id);
+    const handle = typeof timer === "number" ? timers.get(timer) : timer;
+    if (!handle || !handle.active) return;
+    handle.active = false;
+    timers.delete(handle.id);
+    __runtimeCancelTimer(handle.id);
   };
   globalThis.setInterval = (callback, delay = 1, ...args) => {
     if (typeof callback !== "function") throw new TypeError("The callback argument must be of type function");
     delay = Math.min(2_147_483_647, Math.max(1, Number(delay) || 1));
-    const timer = { id: nextTimerId++, callback, args, interval: delay, active: true };
+    const timer = { id: nextTimerId++, callback, args, delay, interval: delay, active: true };
     timers.set(timer.id, timer);
     __runtimeScheduleTimer(timer.id, delay, delay);
-    return timer;
+    return createTimerHandle(timer);
   };
   globalThis.clearInterval = globalThis.clearTimeout;
+  const createTimerHandle = (timer) => {
+    timer.ref = () => {
+      if (timer.active) __runtimeUpdateTimer(timer.id, "ref");
+      return timer;
+    };
+    timer.unref = () => {
+      if (timer.active) __runtimeUpdateTimer(timer.id, "unref");
+      return timer;
+    };
+    timer.hasRef = () => timer.active && __runtimeUpdateTimer(timer.id, "hasRef");
+    timer.refresh = () => {
+      if (timer.active) __runtimeUpdateTimer(timer.id, "refresh");
+      return timer;
+    };
+    timer.close = () => {
+      globalThis.clearTimeout(timer);
+      return timer;
+    };
+    timer[Symbol.toPrimitive] = () => timer.id;
+    return timer;
+  };
   globalThis.setImmediate = (callback, ...args) => {
     const immediate = { id: nextTimerId++, callback, args, active: true };
     immediates.push(immediate);
@@ -1139,10 +1185,52 @@
     immediates.some((immediate) => immediate.active) ||
     __runtimeHasPendingAsync();
   globalThis.__runtimeHasPendingWork = hasPendingWork;
+  const dispatchAsyncEvent = (event) => {
+    if (event.timer !== undefined) {
+      const timer = timers.get(event.timer);
+      if (!timer || !timer.active) return;
+      if (!timer.interval) {
+        timer.active = false;
+        timers.delete(timer.id);
+      }
+      timer.callback(...timer.args);
+    } else if (event.signal !== undefined) {
+      process.emit(event.signal);
+    } else {
+      throw new Error(`Unexpected libuv event: ${JSON.stringify(event)}`);
+    }
+    drainNextTicks();
+  };
   globalThis.__runtimeRunEventLoopTurn = (maxWait = 0, waitWhenIdle = false) => {
     drainNextTicks();
-    let readyCount = immediates.length;
-    while (readyCount-- > 0) {
+    if (inCheckPhase) {
+      if (__runtimeHasQueuedAsyncEvents()) {
+        const queuedEvents = JSON.parse(__runtimePumpAsync(0));
+        if (queuedEvents.length) {
+          dispatchAsyncEvent(queuedEvents[0]);
+        }
+        return hasPendingWork();
+      }
+
+      while (immediates.length) {
+        const immediate = immediates.shift();
+        if (!immediate.active) continue;
+        immediate.callback(...immediate.args);
+        immediate.active = false;
+        drainNextTicks();
+        return hasPendingWork();
+      }
+      inCheckPhase = false;
+    }
+
+    const readyEvents = JSON.parse(__runtimePumpAsync(0));
+    inCheckPhase = true;
+    if (readyEvents.length) {
+      dispatchAsyncEvent(readyEvents[0]);
+      return hasPendingWork();
+    }
+
+    while (immediates.length) {
       const immediate = immediates.shift();
       if (!immediate.active) continue;
       immediate.callback(...immediate.args);
@@ -1155,24 +1243,11 @@
     if (!pending && !waitWhenIdle) return false;
 
     const events = JSON.parse(__runtimePumpAsync(Math.max(0, Number(maxWait) || 0)));
-    for (const event of events) {
-      if (event.timer !== undefined) {
-        const timer = timers.get(event.timer);
-        if (!timer || !timer.active) continue;
-        if (!timer.interval) {
-          timer.active = false;
-          timers.delete(timer.id);
-        }
-        timer.callback(...timer.args);
-        drainNextTicks();
-      } else if (event.signal !== undefined) {
-        process.emit(event.signal);
-      } else {
-        throw new Error(`Unexpected libuv event: ${JSON.stringify(event)}`);
-      }
+    inCheckPhase = true;
+    if (events.length) {
+      dispatchAsyncEvent(events[0]);
     }
 
-    drainNextTicks();
     pending = hasPendingWork();
     return pending;
   };

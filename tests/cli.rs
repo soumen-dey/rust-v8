@@ -80,6 +80,46 @@ fn supports_async_filesystem_promises_and_callbacks() {
 }
 
 #[test]
+fn creates_temp_directories_and_hard_links_asynchronously() {
+    let project = TempProject::new();
+    let prefix = serde_json::to_string(&project.0.join("generated-").to_string_lossy().as_ref())
+        .expect("temporary directory prefix should be encoded");
+    let source = format!(
+        concat!(
+            "const fs = require('node:fs/promises');\n",
+            "fs.mkdtemp({prefix}).then(async (directory) => {{\n",
+            "  const original = directory + '/original.txt';\n",
+            "  const linked = directory + '/linked.txt';\n",
+            "  const copied = directory + '/copied.txt';\n",
+            "  const renamed = directory + '/renamed.txt';\n",
+            "  await fs.writeFile(original, 'linked-data');\n",
+            "  await fs.link(original, linked);\n",
+            "  await fs.copyFile(original, copied);\n",
+            "  await fs.rename(copied, renamed);\n",
+            "  console.log((await fs.readFile(linked, 'utf8')) + ':' + (await fs.readFile(renamed, 'utf8')) + ':' + (await fs.readdir(directory)).length);\n",
+            "}});\n",
+        ),
+        prefix = prefix,
+    );
+
+    let output = runtime()
+        .args(["--eval", &source])
+        .output()
+        .expect("runtime process should start");
+
+    assert!(
+        output.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "linked-data:linked-data:3"
+    );
+}
+
+#[test]
 fn settles_concurrent_libuv_filesystem_requests() {
     let project = TempProject::new();
     let first = serde_json::to_string(&project.0.join("first.txt").to_string_lossy().as_ref())
@@ -121,7 +161,7 @@ fn asynchronous_filesystem_errors_reject_with_node_error_codes() {
     let path = serde_json::to_string(&project.0.join("missing.txt").to_string_lossy().as_ref())
         .expect("filesystem path should be encoded");
     let source = format!(
-        "require('node:fs').promises.readFile({path}).catch((error) => console.log(error.code));"
+        "require('node:fs').promises.readFile({path}).catch((error) => console.log([error.code, error.errno, error.syscall, error.path === {path}].join(':')));"
     );
 
     let output = runtime()
@@ -135,7 +175,10 @@ fn asynchronous_filesystem_errors_reject_with_node_error_codes() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ENOENT");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "ENOENT:-2:open:true"
+    );
 }
 
 #[test]
@@ -219,6 +262,69 @@ fn keeps_interval_alive_until_callback_clears_it() {
 }
 
 #[test]
+fn supports_timer_reference_controls_and_numeric_cancellation() {
+    let unreferenced = runtime()
+        .args([
+            "--eval",
+            "const timer = setTimeout(() => console.log('should-not-fire'), 10).unref(); console.log(timer.hasRef());",
+        ])
+        .output()
+        .expect("runtime process should start");
+
+    assert!(
+        unreferenced.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&unreferenced.stdout),
+        String::from_utf8_lossy(&unreferenced.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&unreferenced.stdout).trim(),
+        "false"
+    );
+
+    let referenced = runtime()
+        .args([
+            "--eval",
+            "const unref = setTimeout(() => console.log('unref-fired'), 1).unref(); setTimeout(() => { console.log('ref-fired'); clearTimeout(+unref); }, 20);",
+        ])
+        .output()
+        .expect("runtime process should start");
+
+    assert!(
+        referenced.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&referenced.stdout),
+        String::from_utf8_lossy(&referenced.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&referenced.stdout).trim(),
+        "unref-fired\nref-fired"
+    );
+}
+
+#[test]
+fn refreshes_a_timer_deadline_without_changing_its_reference_state() {
+    let output = runtime()
+        .args([
+            "--eval",
+            "const timer = setTimeout(() => console.log('fired'), 20); timer.unref().refresh(); console.log(timer.hasRef()); setTimeout(() => timer.ref(), 1);",
+        ])
+        .output()
+        .expect("runtime process should start");
+
+    assert!(
+        output.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "false\nfired"
+    );
+}
+
+#[test]
 fn runs_microtasks_between_due_timer_callbacks() {
     let output = runtime()
         .args([
@@ -269,6 +375,30 @@ fn runs_next_ticks_before_promise_microtasks_and_microtasks_between_immediates()
             "immediate-microtask",
             "immediate-two"
         ]
+    );
+}
+
+#[test]
+fn immediates_run_before_timers_scheduled_from_a_timer_callback() {
+    let output = runtime()
+        .args([
+            "--eval",
+            "setTimeout(() => { console.log('timer-one'); setTimeout(() => console.log('timer-two'), 0); setImmediate(() => console.log('immediate')); }, 0);",
+        ])
+        .output()
+        .expect("runtime process should start");
+
+    assert!(
+        output.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        ["timer-one", "immediate", "timer-two"]
     );
 }
 

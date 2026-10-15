@@ -13,6 +13,12 @@ struct Completion {
     result: Value,
 }
 
+struct Timer {
+    handle: libuv::TimerHandle,
+    timeout: u64,
+    repeat: u64,
+}
+
 enum LoopEvent {
     Completion(Completion),
     Timer(u64),
@@ -27,7 +33,7 @@ pub struct AsyncIo {
     pending: HashMap<u64, Global<PromiseResolver>>,
     next_id: u64,
     queued_events: VecDeque<LoopEvent>,
-    timers: HashMap<u64, libuv::TimerHandle>,
+    timers: HashMap<u64, Timer>,
     signals: HashMap<String, libuv::SignalHandle>,
     pending_rejections: Vec<(Global<v8::Promise>, Global<v8::Value>)>,
     pending_rejection_handled: Vec<Global<v8::Promise>>,
@@ -70,7 +76,13 @@ impl AsyncIo {
     }
 
     pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty() || !self.timers.is_empty() || !self.signals.is_empty()
+        !self.pending.is_empty()
+            || self.timers.values().any(|timer| timer.handle.has_ref())
+            || !self.signals.is_empty()
+    }
+
+    pub fn has_queued_events(&self) -> bool {
+        !self.queued_events.is_empty()
     }
 
     fn track_promise_rejection(
@@ -184,17 +196,48 @@ impl AsyncIo {
             timer.close(());
             return Err(format!("could not start libuv timer: {error}"));
         }
-        self.timers.insert(id, timer);
+        self.timers.insert(
+            id,
+            Timer {
+                handle: timer,
+                timeout,
+                repeat,
+            },
+        );
         Ok(())
     }
 
     fn cancel_timer(&mut self, id: u64) -> Result<(), String> {
         if let Some(mut timer) = self.timers.remove(&id) {
-            let stop_result = timer.stop();
-            timer.close(());
+            let stop_result = timer.handle.stop();
+            timer.handle.close(());
             stop_result.map_err(|error| format!("could not stop libuv timer: {error}"))?;
         }
         Ok(())
+    }
+
+    fn update_timer(&mut self, id: u64, action: &str) -> Result<bool, String> {
+        let Some(timer) = self.timers.get_mut(&id) else {
+            return Ok(false);
+        };
+        match action {
+            "ref" => timer.handle.r#ref(),
+            "unref" => timer.handle.unref(),
+            "hasRef" => {}
+            "refresh" => {
+                let sender = self.sender.clone();
+                timer
+                    .handle
+                    .start(timer.timeout, timer.repeat, move |_| {
+                        if sender.send(LoopEvent::Timer(id)).is_err() {
+                            eprintln!("node: timer event receiver disconnected");
+                        }
+                    })
+                    .map_err(|error| format!("could not refresh libuv timer: {error}"))?;
+            }
+            _ => return Err(format!("unsupported timer action '{action}'")),
+        }
+        Ok(timer.handle.has_ref())
     }
 
     fn watch_signal(&mut self, name: String, signal: i32, watch: bool) -> Result<(), String> {
@@ -285,11 +328,7 @@ impl AsyncIo {
                     }
                 }
                 LoopEvent::Timer(id) => {
-                    if self
-                        .timers
-                        .get(&id)
-                        .is_some_and(|timer| timer.get_repeat() == 0)
-                    {
+                    if self.timers.get(&id).is_some_and(|timer| timer.repeat == 0) {
                         self.cancel_timer(id)?;
                     }
                     events.push(json!({"timer": id}));
@@ -306,7 +345,7 @@ impl AsyncIo {
 impl Drop for AsyncIo {
     fn drop(&mut self) {
         for (_, mut timer) in self.timers.drain() {
-            timer.close(());
+            timer.handle.close(());
         }
         for (_, mut signal) in self.signals.drain() {
             if let Err(error) = signal.stop() {
@@ -397,6 +436,27 @@ pub fn cancel_timer(
     }
 }
 
+pub fn update_timer(
+    scope: &mut HandleScope,
+    args: v8::FunctionCallbackArguments,
+    mut return_value: v8::ReturnValue,
+) {
+    let id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    let action = args.get(1).to_rust_string_lossy(scope);
+    let pointer = scope
+        .get_current_context()
+        .get_aligned_pointer_from_embedder_data(ASYNC_IO_SLOT);
+    if pointer.is_null() {
+        return_value.set(v8::Boolean::new(scope, false).into());
+        return;
+    }
+    let state = unsafe { &mut *pointer.cast::<AsyncIo>() };
+    match state.update_timer(id, &action) {
+        Ok(referenced) => return_value.set(v8::Boolean::new(scope, referenced).into()),
+        Err(error) => throw_error(scope, &mut return_value, &error),
+    }
+}
+
 pub fn watch_signal(
     scope: &mut HandleScope,
     args: v8::FunctionCallbackArguments,
@@ -477,6 +537,18 @@ pub fn has_pending(
         .get_aligned_pointer_from_embedder_data(ASYNC_IO_SLOT);
     let pending = !pointer.is_null() && unsafe { &*pointer.cast::<AsyncIo>() }.has_pending();
     return_value.set(v8::Boolean::new(scope, pending).into());
+}
+
+pub fn has_queued_events(
+    scope: &mut HandleScope,
+    _args: v8::FunctionCallbackArguments,
+    mut return_value: v8::ReturnValue,
+) {
+    let pointer = scope
+        .get_current_context()
+        .get_aligned_pointer_from_embedder_data(ASYNC_IO_SLOT);
+    let queued = !pointer.is_null() && unsafe { &*pointer.cast::<AsyncIo>() }.has_queued_events();
+    return_value.set(v8::Boolean::new(scope, queued).into());
 }
 
 pub fn take_unhandled_rejections(

@@ -438,6 +438,12 @@ fn install_globals(
     install_callback(
         scope,
         global,
+        "__runtimeUpdateTimer",
+        async_io::update_timer,
+    )?;
+    install_callback(
+        scope,
+        global,
         "__runtimeWatchSignal",
         async_io::watch_signal,
     )?;
@@ -452,6 +458,12 @@ fn install_globals(
         global,
         "__runtimeHasPendingAsync",
         async_io::has_pending,
+    )?;
+    install_callback(
+        scope,
+        global,
+        "__runtimeHasQueuedAsyncEvents",
+        async_io::has_queued_events,
     )?;
     install_callback(
         scope,
@@ -812,7 +824,11 @@ pub(crate) fn fs_operation(operation: &str, first: &str, second: &str) -> serde_
         "exists" => Ok(json!(first_path.exists())),
         "mkdir" => fs::create_dir(&first_path).map(|()| json!(null)),
         "mkdirRecursive" => fs::create_dir_all(&first_path).map(|()| json!(null)),
+        "mkdtemp" => create_temp_directory(first).map(|path| json!(path)),
         "copyFile" => fs::copy(&first_path, &second_path).map(|bytes| json!(bytes)),
+        "hardLink" => fs::hard_link(&first_path, &second_path).map(|()| json!(null)),
+        "symlinkFile" => create_symlink(&first_path, &second_path, false).map(|()| json!(null)),
+        "symlinkDir" => create_symlink(&first_path, &second_path, true).map(|()| json!(null)),
         "access" => fs::metadata(&first_path).map(|_| json!(null)),
         "truncate" => parse_u64(second)
             .and_then(|length| {
@@ -871,19 +887,138 @@ pub(crate) fn fs_operation(operation: &str, first: &str, second: &str) -> serde_
     match result {
         Ok(value) => json!({ "value": value }),
         Err(error) => {
-            let code = match error.kind() {
-                std::io::ErrorKind::NotFound => "ENOENT",
-                std::io::ErrorKind::PermissionDenied => "EACCES",
-                std::io::ErrorKind::AlreadyExists => "EEXIST",
-                _ => "ERR_FS",
-            };
+            let code = filesystem_error_code(&error);
+            let mut details = json!({
+                "code": code,
+                "errno": filesystem_errno(code),
+                "message": error.to_string(),
+                "syscall": filesystem_syscall(operation),
+                "path": first_path.to_string_lossy(),
+            });
+            if matches!(operation, "rename" | "copyFile") {
+                details["dest"] = json!(second_path.to_string_lossy());
+            }
             json!({
-                "error": {
-                    "code": code,
-                    "message": error.to_string()
-                }
+                "error": details
             })
         }
+    }
+}
+
+fn filesystem_error_code(error: &std::io::Error) -> &'static str {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => "ENOENT",
+        std::io::ErrorKind::PermissionDenied => "EACCES",
+        std::io::ErrorKind::AlreadyExists => "EEXIST",
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => "EINVAL",
+        std::io::ErrorKind::NotADirectory => "ENOTDIR",
+        std::io::ErrorKind::IsADirectory => "EISDIR",
+        std::io::ErrorKind::DirectoryNotEmpty => "ENOTEMPTY",
+        std::io::ErrorKind::StorageFull => "ENOSPC",
+        std::io::ErrorKind::ReadOnlyFilesystem => "EROFS",
+        std::io::ErrorKind::TimedOut => "ETIMEDOUT",
+        std::io::ErrorKind::Interrupted => "EINTR",
+        std::io::ErrorKind::Unsupported => "ENOSYS",
+        _ => "ERR_FS",
+    }
+}
+
+fn filesystem_errno(code: &str) -> i32 {
+    match code {
+        "ENOENT" => -2,
+        "EINTR" => -4,
+        "EIO" => -5,
+        "EBADF" => -9,
+        "EAGAIN" => -11,
+        "ENOMEM" => -12,
+        "EACCES" => -13,
+        "EBUSY" => -16,
+        "EEXIST" => -17,
+        "EXDEV" => -18,
+        "ENOTDIR" => -20,
+        "EISDIR" => -21,
+        "EINVAL" => -22,
+        "ENFILE" => -23,
+        "EMFILE" => -24,
+        "EFBIG" => -27,
+        "ENOSPC" => -28,
+        "EROFS" => -30,
+        "EMLINK" => -31,
+        "EPIPE" => -32,
+        "ENAMETOOLONG" => -36,
+        "ENOSYS" => -38,
+        "ENOTEMPTY" => -39,
+        "ETIMEDOUT" => -110,
+        _ => -1,
+    }
+}
+
+fn filesystem_syscall(operation: &str) -> &'static str {
+    match operation {
+        "readFile" => "open",
+        "writeFile" | "appendFile" => "open",
+        "exists" => "access",
+        "mkdir" | "mkdirRecursive" => "mkdir",
+        "mkdtemp" => "mkdtemp",
+        "copyFile" => "copyfile",
+        "hardLink" => "link",
+        "symlinkFile" | "symlinkDir" => "symlink",
+        "access" => "access",
+        "truncate" => "truncate",
+        "chmod" => "chmod",
+        "realpath" => "realpath",
+        "readlink" => "readlink",
+        "removeFile" | "unlink" => "unlink",
+        "removeDir" | "removeDirRecursive" => "rmdir",
+        "lstat" => "lstat",
+        "stat" => "stat",
+        "readdir" => "scandir",
+        "rename" => "rename",
+        _ => "unknown",
+    }
+}
+
+fn create_temp_directory(prefix: &str) -> Result<String, std::io::Error> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+    let base = format!(
+        "{prefix}{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(std::io::Error::other)?
+            .as_nanos()
+    );
+    for _ in 0..32 {
+        let candidate = format!("{base}-{}", NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed));
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique temporary directory name",
+    ))
+}
+
+#[cfg(unix)]
+fn create_symlink(
+    target: &PathBuf,
+    link: &PathBuf,
+    _directory: bool,
+) -> Result<(), std::io::Error> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_symlink(target: &PathBuf, link: &PathBuf, directory: bool) -> Result<(), std::io::Error> {
+    if directory {
+        std::os::windows::fs::symlink_dir(target, link)
+    } else {
+        std::os::windows::fs::symlink_file(target, link)
     }
 }
 
