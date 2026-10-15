@@ -93,11 +93,12 @@ fn run_repl() -> ExitCode {
     v8::V8::initialize_platform(platform);
     v8::V8::initialize();
 
-    let result = {
+    let (result, status) = {
         let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
         isolate
             .set_host_initialize_import_meta_object_callback(module_loader::initialize_import_meta);
         isolate.set_host_import_module_dynamically_callback(module_loader::dynamic_import);
+        isolate.set_promise_reject_callback(async_io::promise_reject_callback);
         let handle_scope = &mut v8::HandleScope::new(isolate);
         let context = v8::Context::new(handle_scope, Default::default());
         let scope = &mut v8::ContextScope::new(handle_scope, context);
@@ -109,11 +110,20 @@ fn run_repl() -> ExitCode {
             .and_then(|()| {
                 execute_script(scope, include_str!("bootstrap.js"), "<runtime bootstrap>")
             })
-            .and_then(|()| repl_loop(scope));
+            .and_then(|()| repl_loop(scope, &async_io));
+        let result = if async_io.exit_code().is_some() {
+            Ok(())
+        } else {
+            result
+        };
+        let (result, status) = match finalize_process(scope) {
+            Ok(status) => (result, status),
+            Err(error) => (Err(error), 1),
+        };
         async_io.detach(context);
         module_loader.detach(context);
         drop(async_io);
-        result
+        (result, status)
     };
 
     unsafe {
@@ -122,7 +132,7 @@ fn run_repl() -> ExitCode {
     v8::V8::dispose_platform();
 
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => ExitCode::from(status),
         Err(error) => {
             eprintln!("node: {error}");
             ExitCode::FAILURE
@@ -130,7 +140,10 @@ fn run_repl() -> ExitCode {
     }
 }
 
-fn repl_loop(scope: &mut v8::ContextScope<'_, v8::HandleScope<'_>>) -> Result<(), String> {
+fn repl_loop(
+    scope: &mut v8::ContextScope<'_, v8::HandleScope<'_>>,
+    async_io: &async_io::AsyncIo,
+) -> Result<(), String> {
     let interactive = io::stdin().is_terminal();
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
@@ -160,6 +173,7 @@ fn repl_loop(scope: &mut v8::ContextScope<'_, v8::HandleScope<'_>>) -> Result<()
                     _ => match execute_repl_input(scope, &input) {
                         Ok(Some(output)) => println!("{output}"),
                         Ok(None) => {}
+                        Err(_) if async_io.exit_code().is_some() => return Ok(()),
                         Err(error) => eprintln!("{error}"),
                     },
                 }
@@ -178,6 +192,7 @@ fn repl_loop(scope: &mut v8::ContextScope<'_, v8::HandleScope<'_>>) -> Result<()
             Ok(true) => {}
             Ok(false) if input_closed => return Ok(()),
             Ok(false) => {}
+            Err(_) if async_io.exit_code().is_some() => return Ok(()),
             Err(error) => eprintln!("{error}"),
         }
     }
@@ -255,11 +270,12 @@ fn run(source: &str, filename: &str, args: &[String], check_only: bool) -> ExitC
     v8::V8::initialize_platform(platform);
     v8::V8::initialize();
 
-    let result = {
+    let (result, status) = {
         let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
         isolate
             .set_host_initialize_import_meta_object_callback(module_loader::initialize_import_meta);
         isolate.set_host_import_module_dynamically_callback(module_loader::dynamic_import);
+        isolate.set_promise_reject_callback(async_io::promise_reject_callback);
         let handle_scope = &mut v8::HandleScope::new(isolate);
         let context = v8::Context::new(handle_scope, Default::default());
         let scope = &mut v8::ContextScope::new(handle_scope, context);
@@ -309,10 +325,24 @@ fn run(source: &str, filename: &str, args: &[String], check_only: bool) -> ExitC
                 })
             }
         };
+        let result = if async_io.exit_code().is_some() {
+            Ok(())
+        } else {
+            result
+        };
+        let finalized = if check_only {
+            Ok(0)
+        } else {
+            finalize_process(scope)
+        };
+        let (result, status) = match finalized {
+            Ok(status) => (result, status),
+            Err(error) => (Err(error), 1),
+        };
         async_io.detach(context);
         module_loader.detach(context);
         drop(async_io);
-        result
+        (result, status)
     };
 
     unsafe {
@@ -321,7 +351,7 @@ fn run(source: &str, filename: &str, args: &[String], check_only: bool) -> ExitC
     v8::V8::dispose_platform();
 
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => ExitCode::from(status),
         Err(error) => {
             eprintln!("node: {error}");
             ExitCode::FAILURE
@@ -409,8 +439,50 @@ fn install_globals(
     install_callback(
         scope,
         global,
+        "__runtimeScheduleTimer",
+        async_io::schedule_timer,
+    )?;
+    install_callback(
+        scope,
+        global,
+        "__runtimeCancelTimer",
+        async_io::cancel_timer,
+    )?;
+    install_callback(
+        scope,
+        global,
+        "__runtimeWatchSignal",
+        async_io::watch_signal,
+    )?;
+    install_callback(
+        scope,
+        global,
+        "__runtimeRequestExit",
+        async_io::request_exit,
+    )?;
+    install_callback(
+        scope,
+        global,
+        "__runtimeIsExitRequested",
+        async_io::is_exit_requested,
+    )?;
+    install_callback(
+        scope,
+        global,
         "__runtimeHasPendingAsync",
         async_io::has_pending,
+    )?;
+    install_callback(
+        scope,
+        global,
+        "__runtimeTakeUnhandledRejections",
+        async_io::take_unhandled_rejections,
+    )?;
+    install_callback(
+        scope,
+        global,
+        "__runtimeTakeHandledRejections",
+        async_io::take_handled_rejections,
     )?;
     install_callback(scope, global, "__runtimeProcess", runtime_process)?;
     Ok(())
@@ -458,22 +530,61 @@ fn execute_script(
     }
 }
 
+fn finalize_process(scope: &mut v8::ContextScope<'_, v8::HandleScope<'_>>) -> Result<u8, String> {
+    execute_script(scope, "__runtimeFinalizeProcess()", "<process exit>")?;
+    let handle_scope = &mut v8::HandleScope::new(scope);
+    let try_catch = &mut v8::TryCatch::new(handle_scope);
+    let code = v8::String::new(try_catch, "Number(process.exitCode)")
+        .ok_or_else(|| "could not allocate process exit-code query".to_owned())?;
+    let script = v8::Script::compile(try_catch, code, None)
+        .ok_or_else(|| caught_exception(try_catch, "compilation", "<process exit>"))?;
+    let status = script
+        .run(try_catch)
+        .ok_or_else(|| caught_exception(try_catch, "execution", "<process exit>"))?
+        .integer_value(try_catch)
+        .unwrap_or(0);
+    Ok(status.rem_euclid(256) as u8)
+}
+
 fn run_event_loop_turn(
     scope: &mut v8::ContextScope<'_, v8::HandleScope<'_>>,
     wait_ms: u64,
     wait_when_idle: bool,
 ) -> Result<bool, String> {
+    AsMut::<v8::Isolate>::as_mut(scope).perform_microtask_checkpoint();
+    execute_script(
+        scope,
+        "__runtimeDispatchUnhandledRejections()",
+        "<unhandled rejection handler>",
+    )?;
+    AsMut::<v8::Isolate>::as_mut(scope).perform_microtask_checkpoint();
     let source = format!("__runtimeRunEventLoopTurn({wait_ms}, {wait_when_idle})");
+    {
+        let handle_scope = &mut v8::HandleScope::new(scope);
+        let try_catch = &mut v8::TryCatch::new(handle_scope);
+        let code = v8::String::new(try_catch, &source)
+            .ok_or_else(|| "could not allocate event-loop turn".to_owned())?;
+        let script = v8::Script::compile(try_catch, code, None)
+            .ok_or_else(|| caught_exception(try_catch, "compilation", "<event loop>"))?;
+        script
+            .run(try_catch)
+            .ok_or_else(|| caught_exception(try_catch, "execution", "<event loop>"))?;
+    }
+    AsMut::<v8::Isolate>::as_mut(scope).perform_microtask_checkpoint();
+    execute_script(
+        scope,
+        "__runtimeDispatchUnhandledRejections()",
+        "<unhandled rejection handler>",
+    )?;
+    AsMut::<v8::Isolate>::as_mut(scope).perform_microtask_checkpoint();
+    read_pending_work(scope)
+}
+
+fn read_pending_work(
+    scope: &mut v8::ContextScope<'_, v8::HandleScope<'_>>,
+) -> Result<bool, String> {
     let handle_scope = &mut v8::HandleScope::new(scope);
     let try_catch = &mut v8::TryCatch::new(handle_scope);
-    let code = v8::String::new(try_catch, &source)
-        .ok_or_else(|| "could not allocate event-loop turn".to_owned())?;
-    let script = v8::Script::compile(try_catch, code, None)
-        .ok_or_else(|| caught_exception(try_catch, "compilation", "<event loop>"))?;
-    script
-        .run(try_catch)
-        .ok_or_else(|| caught_exception(try_catch, "execution", "<event loop>"))?;
-    AsMut::<v8::Isolate>::as_mut(try_catch).perform_microtask_checkpoint();
     let status_code = v8::String::new(try_catch, "__runtimeHasPendingWork()")
         .ok_or_else(|| "could not allocate event-loop status query".to_owned())?;
     let status_script = v8::Script::compile(try_catch, status_code, None)
@@ -487,7 +598,18 @@ fn run_event_loop_turn(
 
 fn drain_event_loop(scope: &mut v8::ContextScope<'_, v8::HandleScope<'_>>) -> Result<(), String> {
     loop {
-        if !run_event_loop_turn(scope, 250, false)? {
+        if run_event_loop_turn(scope, 250, false)? {
+            continue;
+        }
+        execute_script(scope, "__runtimeEmitBeforeExit()", "<beforeExit event>")?;
+        AsMut::<v8::Isolate>::as_mut(scope).perform_microtask_checkpoint();
+        execute_script(
+            scope,
+            "__runtimeDispatchUnhandledRejections()",
+            "<unhandled rejection handler>",
+        )?;
+        AsMut::<v8::Isolate>::as_mut(scope).perform_microtask_checkpoint();
+        if !read_pending_work(scope)? {
             return Ok(());
         }
     }

@@ -32,19 +32,24 @@ for Node.js**. The current implementation includes:
 - A libuv-backed event-loop wait/work queue with a JavaScript task scheduler
   for next-tick/immediate/timer callbacks; the REPL continues servicing work
   while waiting for input, and ES modules can await filesystem Promises.
+- Libuv-backed timeout/interval handles, selected process signal listeners,
+  `beforeExit`/`exit` lifecycle events, `process.exit()`/`process.exitCode`,
+  and unhandled-rejection reporting including `rejectionHandled`.
 
 The compatibility layers are incomplete and have observable differences from
 Node. Native module linking does not yet implement every Node resolution rule,
 all import-attribute forms, complete CommonJS named-export detection, or the
 entire built-in-module namespace. The runtime now uses libuv for its loop,
-timer-based waits, and thread-pool work requests, but it does not yet expose
-Node's complete libuv-backed handle and request APIs. Networking, DNS,
-filesystem watchers, child processes, signals, complete filesystem semantics,
-production-grade streams and workers, npm install behavior, advanced REPL
-features, and native addons are not implemented. Timer phase ordering and
-error handling also differ from Node. Several built-in module names resolve
-but are not implemented. Do not use this runtime as a drop-in Node replacement
-yet.
+timer handles, timer-based waits, selected signal watchers, and thread-pool
+work requests, but it does not yet expose Node's complete libuv-backed handle
+and request APIs. Signal support is limited to selected signals and has not
+been validated on every operating system. Networking, DNS, filesystem
+watchers, child processes, complete filesystem semantics, production-grade
+streams and workers, npm install behavior, advanced REPL features, and native
+addons are not implemented. Timer phase ordering, uncaught-error behavior,
+and shutdown semantics also differ from Node. Several built-in module names
+resolve but are not implemented. Do not use this runtime as a drop-in Node
+replacement yet.
 
 ## Build
 

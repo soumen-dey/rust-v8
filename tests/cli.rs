@@ -193,6 +193,171 @@ fn keeps_interval_alive_until_callback_clears_it() {
 }
 
 #[test]
+fn process_exit_stops_script_and_emits_exit_with_requested_code() {
+    let output = runtime()
+        .args([
+            "--eval",
+            "process.on('exit', (code) => console.log('exit:' + code)); console.log('before'); process.exit(7); console.log('after');",
+        ])
+        .output()
+        .expect("runtime process should start");
+
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        ["before", "exit:7"]
+    );
+}
+
+#[test]
+fn process_exit_code_is_used_after_normal_event_loop_drain() {
+    let output = runtime()
+        .args([
+            "--eval",
+            "process.exitCode = 9; process.on('exit', (code) => console.log('exit:' + code));",
+        ])
+        .output()
+        .expect("runtime process should start");
+
+    assert_eq!(output.status.code(), Some(9));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "exit:9");
+}
+
+#[test]
+fn reports_unhandled_rejections_created_during_before_exit() {
+    let output = runtime()
+        .args([
+            "--eval",
+            "process.on('beforeExit', () => Promise.reject(new Error('beforeExit rejection')));",
+        ])
+        .output()
+        .expect("runtime process should start");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("beforeExit rejection"));
+}
+
+#[test]
+fn unhandled_rejections_set_failure_status_and_handled_rejections_do_not() {
+    let unhandled = runtime()
+        .args(["--eval", "Promise.reject(new Error('unhandled'))"])
+        .output()
+        .expect("runtime process should start");
+    assert_eq!(unhandled.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&unhandled.stderr).contains("unhandled"));
+
+    let handled = runtime()
+        .args([
+            "--eval",
+            "Promise.reject(new Error('handled')).catch(() => console.log('caught'));",
+        ])
+        .output()
+        .expect("runtime process should start");
+    assert!(handled.status.success());
+    assert_eq!(String::from_utf8_lossy(&handled.stdout).trim(), "caught");
+}
+
+#[test]
+fn emits_rejection_handled_after_a_late_catch() {
+    let output = runtime()
+        .args([
+            "--eval",
+            "process.on('unhandledRejection', () => console.log('unhandled')); process.on('rejectionHandled', () => console.log('handled')); const rejection = Promise.reject('late'); setTimeout(() => rejection.catch(() => {}), 1);",
+        ])
+        .output()
+        .expect("runtime process should start");
+
+    assert!(
+        output.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        ["unhandled", "handled"]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dispatches_libuv_signal_to_process_listeners() {
+    let mut child = runtime()
+        .args([
+            "--eval",
+            "process.on('SIGUSR1', () => { console.log('signal-received'); process.removeAllListeners('SIGUSR1'); });",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("runtime process should start");
+    let signal = std::process::Command::new("sh")
+        .args(["-c", &format!("sleep 0.1; kill -USR1 {}", child.id())])
+        .status()
+        .expect("signal helper should start");
+    assert!(signal.success(), "signal helper did not send SIGUSR1");
+    let output = child
+        .wait_with_output()
+        .expect("runtime should finish after signal listener removal");
+
+    assert!(
+        output.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "signal-received"
+    );
+}
+
+#[test]
+fn closing_last_signal_listener_releases_libuv_handle() {
+    let output = runtime()
+        .args([
+            "--eval",
+            "process.on('SIGTERM', () => {}); process.removeAllListeners('SIGTERM'); console.log('signal-watch-closed');",
+        ])
+        .output()
+        .expect("runtime process should start");
+
+    assert!(
+        output.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "signal-watch-closed"
+    );
+}
+
+#[test]
+fn before_exit_listener_can_schedule_more_work() {
+    let output = runtime()
+        .args([
+            "--eval",
+            "let beforeExitCount = 0; process.on('beforeExit', () => { if (beforeExitCount++ === 0) setTimeout(() => console.log('scheduled'), 1); });",
+        ])
+        .output()
+        .expect("runtime process should start");
+
+    assert!(
+        output.status.success(),
+        "runtime failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "scheduled");
+}
+
+#[test]
 fn top_level_await_can_wait_for_async_filesystem_io() {
     let project = TempProject::new();
     let contents_path = project.0.join("contents.txt");

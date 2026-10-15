@@ -3,7 +3,7 @@
   let activeModuleFilename = null;
   const nextTicks = [];
   const immediates = [];
-  const timers = [];
+  const timers = new Map();
   let nextTimerId = 1;
 
   function createRequire(parentFilename, importMode = false) {
@@ -639,6 +639,59 @@
     }
   }
 
+  process._events = Object.create(null);
+  Object.setPrototypeOf(process, EventEmitter.prototype);
+  const signalNumbers = {
+    SIGHUP: 1,
+    SIGINT: 2,
+    SIGTERM: 15,
+  };
+  if (process.platform === "win32") {
+    signalNumbers.SIGBREAK = 21;
+  } else if (process.platform === "darwin") {
+    Object.assign(signalNumbers, { SIGUSR1: 30, SIGUSR2: 31, SIGWINCH: 28 });
+  } else {
+    Object.assign(signalNumbers, { SIGUSR1: 10, SIGUSR2: 12, SIGWINCH: 28 });
+  }
+  const watchSignalIfNeeded = (name) => {
+    if (Object.prototype.hasOwnProperty.call(signalNumbers, name)) {
+      __runtimeWatchSignal(name, signalNumbers[name], process.listenerCount(name) > 0);
+    }
+  };
+  for (const method of ["on", "once"]) {
+    const original = EventEmitter.prototype[method];
+    if (!original) continue;
+    process[method] = function (name, listener) {
+      const result = original.call(this, name, listener);
+      watchSignalIfNeeded(String(name));
+      return result;
+    };
+  }
+  for (const method of ["removeListener", "off"]) {
+    process[method] = function (name, listener) {
+      const result = EventEmitter.prototype.removeListener.call(this, name, listener);
+      watchSignalIfNeeded(String(name));
+      return result;
+    };
+  }
+  process.removeAllListeners = function (name) {
+    if (name === undefined) {
+      EventEmitter.prototype.removeAllListeners.call(this);
+      for (const signal of Object.keys(signalNumbers)) watchSignalIfNeeded(signal);
+      return this;
+    }
+    const result = EventEmitter.prototype.removeAllListeners.call(this, name);
+    watchSignalIfNeeded(String(name));
+    return result;
+  };
+  process.exitCode = 0;
+  process.exit = (code = process.exitCode) => {
+    const value = Number(code);
+    if (!Number.isFinite(value)) throw new TypeError("The exit code must be a finite number");
+    process.exitCode = ((Math.trunc(value) % 256) + 256) % 256;
+    __runtimeRequestExit(process.exitCode);
+  };
+
   class Readable extends EventEmitter {
     constructor(options = {}) {
       super();
@@ -952,6 +1005,14 @@
     (this._events[name] ||= []).unshift(wrapped);
     return this;
   };
+  for (const method of ["prependListener", "prependOnceListener"]) {
+    const original = EventEmitter.prototype[method];
+    process[method] = function (name, listener) {
+      const result = original.call(this, name, listener);
+      watchSignalIfNeeded(String(name));
+      return result;
+    };
+  }
   globalThis.require = createRequire(null);
   globalThis.__runtimeRunMain = (filename) => {
     mainFilename = filename;
@@ -1022,15 +1083,26 @@
     },
   });
 
-  globalThis.setTimeout = (callback, delay = 0, ...args) => {
-    const timer = { id: nextTimerId++, callback, args, due: Date.now() + Math.max(0, Number(delay) || 0), interval: 0, active: true };
-    timers.push(timer);
+  globalThis.setTimeout = (callback, delay = 1, ...args) => {
+    if (typeof callback !== "function") throw new TypeError("The callback argument must be of type function");
+    delay = Math.min(2_147_483_647, Math.max(1, Number(delay) || 1));
+    const timer = { id: nextTimerId++, callback, args, interval: 0, active: true };
+    timers.set(timer.id, timer);
+    __runtimeScheduleTimer(timer.id, delay, 0);
     return timer;
   };
-  globalThis.clearTimeout = (timer) => { if (timer) timer.active = false; };
+  globalThis.clearTimeout = (timer) => {
+    if (!timer || !timer.active) return;
+    timer.active = false;
+    timers.delete(timer.id);
+    __runtimeCancelTimer(timer.id);
+  };
   globalThis.setInterval = (callback, delay = 1, ...args) => {
-    const timer = globalThis.setTimeout(callback, delay, ...args);
-    timer.interval = Math.max(1, Number(delay) || 1);
+    if (typeof callback !== "function") throw new TypeError("The callback argument must be of type function");
+    delay = Math.min(2_147_483_647, Math.max(1, Number(delay) || 1));
+    const timer = { id: nextTimerId++, callback, args, interval: delay, active: true };
+    timers.set(timer.id, timer);
+    __runtimeScheduleTimer(timer.id, delay, delay);
     return timer;
   };
   globalThis.clearInterval = globalThis.clearTimeout;
@@ -1048,7 +1120,6 @@
   const hasPendingWork = () =>
     processNextTick.length > 0 ||
     immediates.some((immediate) => immediate.active) ||
-    timers.some((timer) => timer.active) ||
     __runtimeHasPendingAsync();
   globalThis.__runtimeHasPendingWork = hasPendingWork;
   globalThis.__runtimeRunEventLoopTurn = (maxWait = 0, waitWhenIdle = false) => {
@@ -1060,40 +1131,48 @@
       drainNextTicks();
     }
 
-    const runDueTimers = () => {
-      let now = Date.now();
-      const dueTimers = timers
-        .filter((timer) => timer.active && timer.due <= now)
-        .sort((a, b) => a.due - b.due || a.id - b.id);
-      for (const timer of dueTimers) {
-        if (!timer.active) continue;
-        if (timer.interval) timer.due = now + timer.interval;
-        else timer.active = false;
-        timer.callback(...timer.args);
-        drainNextTicks();
-        now = Date.now();
-      }
-      for (let index = timers.length - 1; index >= 0; index--) {
-        if (!timers[index].active) timers.splice(index, 1);
-      }
-    };
-
-    runDueTimers();
     let pending = hasPendingWork();
     if (!pending && !waitWhenIdle) return false;
 
-    const deadline = Date.now() + Math.max(0, Number(maxWait) || 0);
-    let nextTimer = null;
-    for (const timer of timers) {
-      if (timer.active && (!nextTimer || timer.due < nextTimer.due)) nextTimer = timer;
+    const events = JSON.parse(__runtimePumpAsync(Math.max(0, Number(maxWait) || 0)));
+    for (const event of events) {
+      if (event.timer !== undefined) {
+        const timer = timers.get(event.timer);
+        if (!timer || !timer.active) continue;
+        if (!timer.interval) {
+          timer.active = false;
+          timers.delete(timer.id);
+        }
+        timer.callback(...timer.args);
+        drainNextTicks();
+      } else if (event.signal !== undefined) {
+        process.emit(event.signal);
+      } else {
+        throw new Error(`Unexpected libuv event: ${JSON.stringify(event)}`);
+      }
     }
-    const timerWait = nextTimer ? Math.max(0, nextTimer.due - Date.now()) : Infinity;
-    const wait = Math.min(Math.max(0, deadline - Date.now()), timerWait);
-    if (wait > 0) __runtimePumpAsync(wait);
 
-    runDueTimers();
     drainNextTicks();
     pending = hasPendingWork();
     return pending;
+  };
+  globalThis.__runtimeEmitBeforeExit = () => {
+    if (process.listenerCount("beforeExit")) process.emit("beforeExit", Number(process.exitCode) || 0);
+    return hasPendingWork();
+  };
+  globalThis.__runtimeDispatchUnhandledRejections = () => {
+    for (const [promise, reason] of __runtimeTakeUnhandledRejections()) {
+      if (!process.emit("unhandledRejection", reason, promise)) {
+        console.error(reason && reason.stack || reason);
+        if (!process.exitCode) process.exitCode = 1;
+      }
+    }
+    for (const promise of __runtimeTakeHandledRejections()) {
+      process.emit("rejectionHandled", promise);
+    }
+  };
+  globalThis.__runtimeFinalizeProcess = () => {
+    process.emit("exit", Number(process.exitCode) || 0);
+    return Number(process.exitCode) || 0;
   };
 })();
